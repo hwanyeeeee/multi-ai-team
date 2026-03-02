@@ -30,7 +30,7 @@ AI_MODELS = {
         "binary": "claude",
         "wsl_path": None,  # Resolved at runtime by detect_available_models()
         "args": ["--print"],  # batch mode (one-shot)
-        "interactive_args": [],  # interactive mode (persistent session)
+        "interactive_args": ["--dangerously-skip-permissions"],
         "strengths": ["complex reasoning", "architecture", "code review", "planning"],
         "label": "Claude (Reasoning/Architecture)",
     },
@@ -38,7 +38,7 @@ AI_MODELS = {
         "binary": "codex",
         "wsl_path": None,
         "args": ["exec", "--skip-git-repo-check"],  # batch mode
-        "interactive_args": [],  # interactive mode
+        "interactive_args": ["--full-auto"],
         "strengths": ["code generation", "fast iteration", "debugging", "testing"],
         "label": "Codex (Code/Analysis)",
     },
@@ -46,7 +46,7 @@ AI_MODELS = {
         "binary": "gemini",
         "wsl_path": None,
         "args": ["-p"],  # batch mode
-        "interactive_args": [],  # interactive mode
+        "interactive_args": ["--yolo"],
         "strengths": ["research", "long context", "frontend", "documentation"],
         "label": "Gemini (Research/Frontend)",
     },
