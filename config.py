@@ -154,6 +154,78 @@ AI_RESPONSE_TIMEOUT_SEC = 120
 CHAT_HISTORY_MAX_CHARS = 8000
 CHAT_SYNTHESIS_ENABLED = True
 
+# Orchestration prompt templates (/task auto-delegation)
+ORCH_PLAN_PROMPT = (
+    "You are {label}, part of a multi-AI team.\n"
+    "Your strengths: {strengths}\n\n"
+    "Task: {task}\n\n"
+    "Write a brief plan for how YOU would contribute to this task.\n"
+    "Focus on the parts you're best suited for.\n"
+    "Be specific and actionable. Keep it under 200 words.\n"
+    "Respond in the same language as the task."
+)
+
+ORCH_ASSIGN_PROMPT = (
+    "You are the task coordinator for a multi-AI team.\n"
+    "Task: {task}\n\n"
+    "Plans from each AI:\n{all_plans}\n\n"
+    "AI Strengths:\n{model_strengths}\n\n"
+    "Based on these plans and strengths, assign a specific task to each AI.\n"
+    "Output in this exact format (one line per AI, parseable):\n"
+    "[claude] Specific instruction for Claude\n"
+    "[codex] Specific instruction for Codex\n"
+    "[gemini] Specific instruction for Gemini\n\n"
+    "Each instruction should be a clear, actionable directive.\n"
+    "Only assign tasks to available AIs: {active_models}\n"
+    "Respond in the same language as the task."
+)
+
+ORCH_FINAL_PROMPT = (
+    "Task: {task}\n\n"
+    "Role assignments:\n{assignments}\n\n"
+    "Execution results from each AI:\n{all_results}\n\n"
+    "Synthesize into a comprehensive final output.\n"
+    "Combine all work into a coherent result.\n"
+    "Note any gaps or issues.\n"
+    "Respond in the same language as the task."
+)
+
+# Batch discussion prompts (/batch AI-to-AI debate)
+BATCH_OPEN_PROMPT = (
+    "You are {label}, part of a multi-AI team discussion.\n"
+    "Your strengths: {strengths}\n\n"
+    "Topic: {topic}\n\n"
+    "Share your perspective on this topic.\n"
+    "Be specific and opinionated. Keep it under 200 words.\n"
+    "Respond in the same language as the topic."
+)
+
+BATCH_REPLY_PROMPT = (
+    "You are {label}, part of a multi-AI team discussion.\n"
+    "Your strengths: {strengths}\n\n"
+    "Topic: {topic}\n\n"
+    "Previous discussion:\n{history}\n\n"
+    "Respond to the other AIs' points.\n"
+    "Agree, disagree, or build on their ideas. Be specific.\n"
+    "Keep it under 200 words.\n"
+    "Respond in the same language as the topic."
+)
+
+BATCH_CONSENSUS_PROMPT = (
+    "Topic: {topic}\n\n"
+    "Discussion so far:\n{history}\n\n"
+    "Have the participants reached consensus on the key points?\n"
+    "Answer ONLY 'CONVERGED' or 'NOT_CONVERGED: <brief reason>'."
+)
+
+BATCH_SYNTHESIS_PROMPT = (
+    "Topic: {topic}\n\n"
+    "Full discussion ({rounds} rounds):\n{history}\n\n"
+    "Synthesize the discussion into a final summary.\n"
+    "Include: key agreements, remaining disagreements, and actionable conclusions.\n"
+    "Respond in the same language as the topic."
+)
+
 
 def to_wsl_path(win_path: str) -> str:
     """Convert Windows path to WSL path."""

@@ -148,9 +148,8 @@ def start_interactive(pane_target: str, model_name: str) -> None:
 def send_message_to_pane(pane_target: str, message: str) -> None:
     """Send a chat message to an AI running in interactive mode.
 
-    Sends text literally with -l flag, then Enter separately.
-    This ensures TUI-based CLIs (Claude Code, Codex, Gemini) receive
-    the text and submit it correctly.
+    Sends text literally with -l flag, pauses briefly so the TUI can
+    process the input, then sends Enter separately.
     """
     # Send text literally (no key name interpretation)
     subprocess.run(
@@ -158,6 +157,8 @@ def send_message_to_pane(pane_target: str, message: str) -> None:
         capture_output=True,
         timeout=5,
     )
+    # Brief pause so TUI apps (especially Codex) register the text
+    time.sleep(0.2)
     # Send Enter key separately to submit
     subprocess.run(
         wsl_prefix() + ["tmux", "send-keys", "-t", pane_target, "Enter"],
@@ -175,5 +176,95 @@ def capture_pane_content(pane_target: str, lines: int = 100) -> str:
         timeout=5,
     )
     return result.stdout.strip()
+
+
+def wait_for_all_panes_idle(
+    pane_targets: dict[str, str],
+    stable_secs: int = 5,
+    timeout: int = 90,
+) -> dict[str, str]:
+    """Wait for multiple tmux panes to stop changing, then capture content.
+
+    Two-phase approach:
+    1. Wait for each pane's content to CHANGE (AI started responding).
+    2. Then wait for it to STABILIZE (AI finished responding).
+
+    This prevents premature idle detection when an AI hasn't started yet.
+    """
+    start = time.time()
+    initial_contents: dict[str, str] = {}
+    last_contents: dict[str, str] = {}
+    last_changes: dict[str, float] = {}
+    started: set[str] = set()  # AIs that have started responding
+    done: set[str] = set()     # AIs that have finished responding
+
+    # Snapshot current state BEFORE AI starts responding
+    for name, pane in pane_targets.items():
+        content = capture_pane_content(pane, lines=50)
+        initial_contents[name] = content
+        last_contents[name] = content
+        last_changes[name] = start
+
+    time.sleep(1)
+
+    while (time.time() - start) < timeout and len(done) < len(pane_targets):
+        for name, pane in pane_targets.items():
+            if name in done:
+                continue
+            content = capture_pane_content(pane, lines=50)
+
+            if name not in started:
+                # Phase 1: waiting for content to change from initial snapshot
+                if content != initial_contents[name]:
+                    started.add(name)
+                    last_contents[name] = content
+                    last_changes[name] = time.time()
+            else:
+                # Phase 2: waiting for content to stabilize
+                if content != last_contents[name]:
+                    last_contents[name] = content
+                    last_changes[name] = time.time()
+                elif (time.time() - last_changes[name]) >= stable_secs:
+                    done.add(name)
+
+        if len(done) < len(pane_targets):
+            time.sleep(2)
+
+    # For AIs that started but didn't stabilize, use last captured content
+    # For AIs that never started, use initial content
+    results = {}
+    for name in pane_targets:
+        if name in started:
+            results[name] = last_contents[name]
+        else:
+            results[name] = initial_contents[name]
+
+    return results
+
+
+def synthesize_responses(
+    responses: dict[str, str],
+    user_message: str,
+    work_dir: str,
+) -> str:
+    """Use Claude in batch mode to synthesize multiple AI responses."""
+    parts = []
+    for model, content in responses.items():
+        label = AI_MODELS.get(model, {}).get("label", model)
+        parts.append(f"=== {label} ===\n{content}")
+
+    all_responses = "\n\n".join(parts)
+
+    prompt = (
+        f"User question: {user_message}\n\n"
+        f"Below are responses from AI team members (captured from their terminals):\n\n"
+        f"{all_responses}\n\n"
+        "Synthesize the responses to the user's question above into a concise summary.\n"
+        "Include key points from each AI, note any conflicts, and give a unified recommendation.\n"
+        "Keep it under 300 words. Respond in the same language as the user question."
+    )
+
+    output_file = str(Path(work_dir) / "shared" / "synthesis.txt")
+    return run_ai_cli("claude", prompt, work_dir, output_file)
 
 

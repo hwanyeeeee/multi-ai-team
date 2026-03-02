@@ -14,9 +14,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from config import AI_MODELS
-from ai_worker import send_message_to_pane, capture_pane_content
+from config import AI_MODELS, CHAT_SYNTHESIS_ENABLED
+from ai_worker import (
+    send_message_to_pane,
+    capture_pane_content,
+    wait_for_all_panes_idle,
+    synthesize_responses,
+)
 from conversation import ConversationLog
+from orchestrator import TaskOrchestrator, BatchDiscussion
 
 
 def parse_mentions(
@@ -42,11 +48,21 @@ def parse_mentions(
     return clean, mentioned
 
 
+def _print_synthesis(summary: str) -> None:
+    """Print formatted synthesis result."""
+    print(f"\n{'='*50}")
+    print("  [Synthesis]")
+    print(f"{'='*50}")
+    print(summary)
+    print(f"{'='*50}")
+
+
 def handle_command(
     cmd: str,
     log: ConversationLog,
     active_models: list[str],
     pane_map: dict[str, str],
+    work_dir: str = "",
 ) -> bool:
     """Handle special /commands. Returns True if the loop should exit."""
     lower = cmd.lower().strip()
@@ -83,11 +99,41 @@ def handle_command(
                 responses[model] = content
                 label = AI_MODELS.get(model, {}).get("label", model)
                 print(f"\n--- {label} (last ~80 lines) ---")
-                # Show last 10 lines as preview
                 recent = content.strip().splitlines()[-10:]
                 for line in recent:
                     print(f"  {line}")
+        # Run synthesis if Claude is available
+        if responses and "claude" in active_models and work_dir:
+            print("\n  Synthesizing with Claude...")
+            summary = synthesize_responses(responses, "(manual /synth)", work_dir)
+            _print_synthesis(summary)
         print()
+        return False
+
+    if lower.startswith("/task ") or lower == "/task":
+        task_desc = cmd[5:].strip()
+        if not task_desc:
+            print("Usage: /task <description>")
+            return False
+        if not work_dir:
+            print("Error: work_dir not set. Cannot run /task.")
+            return False
+        orch = TaskOrchestrator(pane_map, work_dir, active_models)
+        result = orch.run(task_desc)
+        _print_synthesis(result)
+        return False
+
+    if lower.startswith("/batch ") or lower == "/batch":
+        topic = cmd[6:].strip()
+        if not topic:
+            print("Usage: /batch <topic>")
+            return False
+        if not work_dir:
+            print("Error: work_dir not set. Cannot run /batch.")
+            return False
+        disc = BatchDiscussion(work_dir, active_models)
+        result = disc.run(topic)
+        _print_synthesis(result)
         return False
 
     if lower == "/help":
@@ -96,13 +142,16 @@ def handle_command(
         print("  /history        - Show message log")
         print("  /clear          - Clear log")
         print("  /models         - Show available AI models")
-        print("  /synth          - Capture & show all AI pane contents")
+        print("  /synth          - Capture AI responses & synthesize")
+        print("  /autosynth      - Toggle auto-synthesis on/off")
+        print("  /task <desc>    - Auto-orchestrate: plan, assign, execute")
+        print("  /batch <topic>  - AI-to-AI discussion until consensus")
         print("  /help           - Show this help")
         print()
         print("Use @model to target specific AIs:")
         print("  @codex analyze this code")
         print("  @claude @gemini review this approach")
-        print("  (no mention = all AIs respond)")
+        print("  (no mention = all AIs respond, auto-synthesis runs)")
         return False
 
     print(f"Unknown command: {cmd}. Type /help for available commands.")
@@ -121,6 +170,7 @@ def run_chat_loop(
     Each CLI maintains its own conversation history.
     """
     log = ConversationLog(work_dir)
+    auto_synth = CHAT_SYNTHESIS_ENABLED and ("claude" in active_models)
 
     print("=" * 50)
     print("  Multi-AI Team Chat")
@@ -128,6 +178,8 @@ def run_chat_loop(
     print(f"  Models: {', '.join(active_models)}")
     print("  AI CLIs are running in interactive mode.")
     print("  Each AI maintains its own conversation history.")
+    synth_status = "ON" if auto_synth else "OFF"
+    print(f"  Auto-synthesis: {synth_status} (/autosynth to toggle)")
     print("  Type /help for commands")
     print("=" * 50)
     print()
@@ -144,7 +196,13 @@ def run_chat_loop(
 
         # Handle /commands
         if user_input.startswith("/"):
-            if handle_command(user_input, log, active_models, pane_map):
+            if user_input.lower().strip() == "/autosynth":
+                auto_synth = not auto_synth
+                state = "ON" if auto_synth else "OFF"
+                print(f"  Auto-synthesis: {state}")
+                print()
+                continue
+            if handle_command(user_input, log, active_models, pane_map, work_dir):
                 break
             continue
 
@@ -170,7 +228,17 @@ def run_chat_loop(
             print(f"  -> Sent to: {', '.join(labels)}")
         else:
             print(f"  -> Sent to all {len(sent)} AIs")
-        print("  (Watch their panes for responses)")
+
+        # Auto-synthesis when 2+ AIs respond
+        if auto_synth and len(sent) >= 2 and work_dir:
+            print("  Waiting for AI responses...")
+            pane_targets = {m: pane_map[m] for m in sent if m in pane_map}
+            responses = wait_for_all_panes_idle(pane_targets)
+            print("  Synthesizing with Claude...")
+            summary = synthesize_responses(responses, clean_msg, work_dir)
+            _print_synthesis(summary)
+        else:
+            print("  (Watch their panes for responses)")
         print()
 
 
