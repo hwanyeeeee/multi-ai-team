@@ -1,0 +1,132 @@
+"""AI Worker - runs CLI commands for each AI model."""
+from __future__ import annotations
+
+import os
+import subprocess
+import time
+from pathlib import Path
+from config import AI_MODELS, AI_RESPONSE_TIMEOUT_SEC, IS_WSL, get_wsl_binary, to_wsl_path, wsl_prefix
+
+
+def run_ai_cli(model_name: str, prompt: str, work_dir: str, output_file: str) -> str:
+    """
+    Run an AI CLI command and capture output to file.
+    Returns the output text.
+    """
+    binary = get_wsl_binary(model_name)
+    args = " ".join(AI_MODELS[model_name]["args"])
+
+    # Write prompt to file to avoid shell escaping issues
+    prompt_file = str(Path(work_dir) / "shared" / f"{model_name}_batch_prompt.txt")
+    Path(prompt_file).parent.mkdir(parents=True, exist_ok=True)
+    Path(prompt_file).write_text(prompt, encoding="utf-8")
+
+    prompt_path = prompt_file if IS_WSL else to_wsl_path(prompt_file)
+    # Use absolute binary path to avoid PATH issues in WSL
+    shell_cmd = f'{binary} {args} "$(cat {prompt_path})"'
+    if IS_WSL:
+        cmd = ["bash", "-c", shell_cmd]
+    else:
+        cmd = ["wsl", "bash", "-lc", shell_cmd]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=AI_RESPONSE_TIMEOUT_SEC,
+            cwd=work_dir,
+        )
+        output = result.stdout.strip()
+        if not output and result.stderr:
+            output = f"[stderr] {result.stderr.strip()}"
+    except subprocess.TimeoutExpired:
+        output = f"[timeout] {model_name} did not respond within {AI_RESPONSE_TIMEOUT_SEC}s"
+    except Exception as e:
+        output = f"[error] {model_name}: {e}"
+
+    # Save to file
+    Path(output_file).parent.mkdir(parents=True, exist_ok=True)
+    Path(output_file).write_text(output, encoding="utf-8")
+
+    return output
+
+
+def run_ai_in_tmux_pane(
+    pane_target: str,
+    model_name: str,
+    prompt: str,
+    output_file: str,
+    work_dir: str,
+) -> None:
+    """
+    Send AI CLI command to a tmux pane so the user can see it running.
+    Output is tee'd to a file for collection.
+    """
+    args = " ".join(AI_MODELS[model_name]["args"])
+
+    # Write prompt to a temp file (avoids shell escaping issues)
+    prompt_file = str(Path(work_dir) / "shared" / f"{model_name}_prompt.txt")
+    Path(prompt_file).parent.mkdir(parents=True, exist_ok=True)
+    Path(prompt_file).write_text(prompt, encoding="utf-8")
+
+    # Convert paths if on Windows
+    tmux_prompt = prompt_file if IS_WSL else to_wsl_path(prompt_file)
+    tmux_output = output_file if IS_WSL else to_wsl_path(output_file)
+
+    # Use absolute binary path to avoid PATH issues
+    binary = get_wsl_binary(model_name)
+    tmux_cmd = (
+        f'{binary} {args} "$(cat {tmux_prompt})" 2>&1 | tee {tmux_output}'
+        f' && echo "===DONE===" >> {tmux_output}'
+    )
+
+    # Send to tmux pane
+    escaped = tmux_cmd.replace("'", "'\\''")
+    subprocess.run(
+        wsl_prefix() + ["tmux", "send-keys", "-t", pane_target, escaped, "Enter"],
+        timeout=5,
+    )
+
+
+def wait_for_completion(output_files: dict[str, str], timeout: int = AI_RESPONSE_TIMEOUT_SEC) -> dict[str, str]:
+    """
+    Wait for all AI workers to complete by checking for ===DONE=== marker.
+    Returns dict of model_name -> output text.
+    """
+    results = {}
+    start = time.time()
+
+    pending = set(output_files.keys())
+
+    while pending and (time.time() - start) < timeout:
+        for model_name in list(pending):
+            fpath = output_files[model_name]
+            if os.path.exists(fpath):
+                content = Path(fpath).read_text(encoding="utf-8", errors="replace")
+                if "===DONE===" in content:
+                    results[model_name] = content.replace("===DONE===", "").strip()
+                    pending.discard(model_name)
+        if pending:
+            time.sleep(2)
+
+    # Handle timeouts
+    for model_name in pending:
+        fpath = output_files[model_name]
+        if os.path.exists(fpath):
+            results[model_name] = Path(fpath).read_text(encoding="utf-8", errors="replace").strip()
+        else:
+            results[model_name] = f"[timeout] No response from {model_name}"
+
+    return results
+
+
+def clear_pane(pane_target: str) -> None:
+    """Clear a tmux pane before showing new output."""
+    subprocess.run(
+        wsl_prefix() + ["tmux", "send-keys", "-t", pane_target, "clear", "Enter"],
+        capture_output=True,
+        timeout=5,
+    )
+
+
