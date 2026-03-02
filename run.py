@@ -103,7 +103,12 @@ def run_batch_mode(task: str, work_dir: str) -> str:
 
 
 def run_tmux_chat(work_dir: str) -> None:
-    """Launch interactive tmux chat mode (default)."""
+    """Launch interactive tmux chat mode (default).
+
+    Starts each AI CLI in interactive mode (persistent session),
+    then launches the chat loop in the input pane.
+    """
+    from ai_worker import start_interactive
     from tmux_manager import (
         create_team_session,
         display_in_pane,
@@ -124,17 +129,18 @@ def run_tmux_chat(work_dir: str) -> None:
     print("Creating tmux session...")
     pane_map = create_team_session(session_name)
 
-    # Show welcome in AI panes
+    # Start AI CLIs in interactive mode (persistent sessions)
+    print("Starting AI CLIs in interactive mode...")
     for role in ("claude", "codex", "gemini"):
         pane = pane_map.get(role)
         if pane and role in active:
-            label = AI_MODELS[role]["label"]
-            display_in_pane(pane, f"=== {label} ===")
-            display_in_pane(pane, "Ready. Waiting for your message...")
+            start_interactive(pane, role)
+            print(f"  {AI_MODELS[role]['label']} - started")
         elif pane:
             display_in_pane(pane, f"=== {role} (not available) ===")
 
-    time.sleep(0.5)
+    # Wait for CLIs to initialize
+    time.sleep(2)
 
     # Launch chat_loop.py in the input pane
     print("Starting chat interface...")

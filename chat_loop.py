@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
 """Interactive chat loop for the multi-AI team tmux interface.
 
-This script runs inside the tmux input pane (pane 3) and manages
-user input, @mention routing, and response display.
+This script runs inside the tmux input pane (pane 3) and relays
+user messages to AI CLIs running in interactive mode in other panes.
 """
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from config import AI_MODELS, AI_RESPONSE_TIMEOUT_SEC, CHAT_SYNTHESIS_ENABLED
-from conversation import ConversationManager
-from ai_worker import run_ai_in_tmux_pane, wait_for_completion, clear_pane
+from config import AI_MODELS
+from ai_worker import send_message_to_pane, capture_pane_content
+from conversation import ConversationLog
 
 
 def parse_mentions(
@@ -44,20 +42,12 @@ def parse_mentions(
     return clean, mentioned
 
 
-def display_response_summary(model_name: str, response: str, max_lines: int = 15) -> None:
-    """Print a short summary of an AI response in the input pane."""
-    label = AI_MODELS.get(model_name, {}).get("label", model_name)
-    lines = response.strip().splitlines()
-    preview = lines[:max_lines]
-    print(f"\n--- {label} ---")
-    for line in preview:
-        print(f"  {line}")
-    if len(lines) > max_lines:
-        print(f"  ... ({len(lines) - max_lines} more lines, see pane)")
-    print()
-
-
-def handle_command(cmd: str, conv: ConversationManager, active_models: list[str]) -> bool:
+def handle_command(
+    cmd: str,
+    log: ConversationLog,
+    active_models: list[str],
+    pane_map: dict[str, str],
+) -> bool:
     """Handle special /commands. Returns True if the loop should exit."""
     lower = cmd.lower().strip()
 
@@ -66,28 +56,47 @@ def handle_command(cmd: str, conv: ConversationManager, active_models: list[str]
         return True
 
     if lower == "/history":
-        print(conv.get_history_display())
+        print(log.display())
         return False
 
     if lower == "/clear":
-        conv.clear()
-        print("Conversation cleared.")
+        log.clear()
+        print("Log cleared.")
         return False
 
     if lower == "/models":
         print("Active models:")
         for m in active_models:
-            label = AI_MODELS.get(m, {}).get("label", m)
-            strengths = ", ".join(AI_MODELS.get(m, {}).get("strengths", []))
+            cfg = AI_MODELS.get(m, {})
+            label = cfg.get("label", m)
+            strengths = ", ".join(cfg.get("strengths", []))
             print(f"  @{m} - {label} ({strengths})")
+        return False
+
+    if lower == "/synth":
+        print("Capturing responses from all panes...")
+        responses = {}
+        for model in active_models:
+            pane = pane_map.get(model)
+            if pane:
+                content = capture_pane_content(pane, lines=80)
+                responses[model] = content
+                label = AI_MODELS.get(model, {}).get("label", model)
+                print(f"\n--- {label} (last ~80 lines) ---")
+                # Show last 10 lines as preview
+                recent = content.strip().splitlines()[-10:]
+                for line in recent:
+                    print(f"  {line}")
+        print()
         return False
 
     if lower == "/help":
         print("Commands:")
         print("  /quit or /exit  - Exit chat")
-        print("  /history        - Show conversation history")
-        print("  /clear          - Clear conversation")
+        print("  /history        - Show message log")
+        print("  /clear          - Clear log")
         print("  /models         - Show available AI models")
+        print("  /synth          - Capture & show all AI pane contents")
         print("  /help           - Show this help")
         print()
         print("Use @model to target specific AIs:")
@@ -106,18 +115,20 @@ def run_chat_loop(
     work_dir: str,
     active_models: list[str],
 ) -> None:
-    """Main interactive chat loop."""
-    conv = ConversationManager(work_dir, active_models)
-    shared_dir = Path(work_dir) / "shared"
-    shared_dir.mkdir(parents=True, exist_ok=True)
-    msg_counter = 0
+    """Main interactive chat loop.
+
+    Simply relays user messages to AI CLIs running in interactive mode.
+    Each CLI maintains its own conversation history.
+    """
+    log = ConversationLog(work_dir)
 
     print("=" * 50)
     print("  Multi-AI Team Chat")
     print("=" * 50)
     print(f"  Models: {', '.join(active_models)}")
+    print("  AI CLIs are running in interactive mode.")
+    print("  Each AI maintains its own conversation history.")
     print("  Type /help for commands")
-    print("  Use @model to target specific AIs")
     print("=" * 50)
     print()
 
@@ -133,7 +144,7 @@ def run_chat_loop(
 
         # Handle /commands
         if user_input.startswith("/"):
-            if handle_command(user_input, conv, active_models):
+            if handle_command(user_input, log, active_models, pane_map):
                 break
             continue
 
@@ -144,85 +155,23 @@ def run_chat_loop(
             continue
 
         target_models = targets if targets else active_models
-        conv.add_user_message(clean_msg, targets)
-        msg_counter += 1
+        log.add("user", clean_msg, targets)
 
-        if targets:
-            target_labels = [AI_MODELS[m]["label"] for m in target_models]
-            print(f"  -> Sending to: {', '.join(target_labels)}")
-        else:
-            print(f"  -> Sending to all ({len(target_models)} models)")
-
-        # Clear all target AI panes, then send prompts
-        target_panes = {}
+        # Send message to each target AI pane
+        sent = []
         for model_name in target_models:
             pane = pane_map.get(model_name)
             if pane:
-                clear_pane(pane)
-                target_panes[model_name] = pane
-        time.sleep(0.2)
+                send_message_to_pane(pane, clean_msg)
+                sent.append(model_name)
 
-        output_files: dict[str, str] = {}
-        for model_name, pane in target_panes.items():
-            prompt = conv.build_prompt(model_name, clean_msg)
-            out_file = str(shared_dir / f"chat_{msg_counter}_{model_name}.txt")
-            try:
-                os.remove(out_file)
-            except FileNotFoundError:
-                pass
-            output_files[model_name] = out_file
-            run_ai_in_tmux_pane(
-                pane_target=pane,
-                model_name=model_name,
-                prompt=prompt,
-                output_file=out_file,
-                work_dir=work_dir,
-            )
-
-        # Wait for responses
-        print("  Waiting for responses...", end="", flush=True)
-        results = wait_for_completion(output_files, timeout=AI_RESPONSE_TIMEOUT_SEC)
-        print(" Done!")
-
-        # Store responses and show summaries
-        for model_name, response in results.items():
-            conv.add_ai_response(model_name, response)
-            display_response_summary(model_name, response)
-
-        # Auto-synthesis when all 3 AIs respond and synthesis is enabled
-        if (
-            CHAT_SYNTHESIS_ENABLED
-            and targets is None
-            and len(results) >= 2
-            and "claude" in results
-        ):
-            print("  [Synthesizing responses...]")
-            synth_prompt = conv.build_synthesis_prompt(clean_msg, results)
-            synth_file = str(shared_dir / f"chat_{msg_counter}_synthesis.txt")
-            try:
-                os.remove(synth_file)
-            except FileNotFoundError:
-                pass
-
-            claude_pane = pane_map.get("claude")
-            if claude_pane:
-                clear_pane(claude_pane)
-                time.sleep(0.2)
-                run_ai_in_tmux_pane(
-                    pane_target=claude_pane,
-                    model_name="claude",
-                    prompt=synth_prompt,
-                    output_file=synth_file,
-                    work_dir=work_dir,
-                )
-                synth_result = wait_for_completion(
-                    {"claude": synth_file}, timeout=AI_RESPONSE_TIMEOUT_SEC
-                )
-                if "claude" in synth_result:
-                    print("\n=== Synthesis ===")
-                    for line in synth_result["claude"].strip().splitlines()[:20]:
-                        print(f"  {line}")
-                    print()
+        if targets:
+            labels = [AI_MODELS[m]["label"] for m in sent]
+            print(f"  -> Sent to: {', '.join(labels)}")
+        else:
+            print(f"  -> Sent to all {len(sent)} AIs")
+        print("  (Watch their panes for responses)")
+        print()
 
 
 def main():
@@ -234,7 +183,7 @@ def main():
 
     active_models = json.loads(args.models)
 
-    # Build pane map from session name
+    # Build pane map from session name (panes 0-2 are AI CLIs)
     pane_map = {
         "claude": f"{args.session}.0",
         "codex": f"{args.session}.1",

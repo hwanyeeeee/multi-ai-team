@@ -29,21 +29,24 @@ AI_MODELS = {
     "claude": {
         "binary": "claude",
         "wsl_path": None,  # Resolved at runtime by detect_available_models()
-        "args": ["--print"],  # --print for non-interactive batch mode
+        "args": ["--print"],  # batch mode (one-shot)
+        "interactive_args": [],  # interactive mode (persistent session)
         "strengths": ["complex reasoning", "architecture", "code review", "planning"],
         "label": "Claude (Reasoning/Architecture)",
     },
     "codex": {
         "binary": "codex",
         "wsl_path": None,
-        "args": ["exec", "--skip-git-repo-check"],  # non-interactive subcommand
+        "args": ["exec", "--skip-git-repo-check"],  # batch mode
+        "interactive_args": [],  # interactive mode
         "strengths": ["code generation", "fast iteration", "debugging", "testing"],
         "label": "Codex (Code/Analysis)",
     },
     "gemini": {
         "binary": "gemini",
         "wsl_path": None,
-        "args": ["-p"],  # prompt mode
+        "args": ["-p"],  # batch mode
+        "interactive_args": [],  # interactive mode
         "strengths": ["research", "long context", "frontend", "documentation"],
         "label": "Gemini (Research/Frontend)",
     },

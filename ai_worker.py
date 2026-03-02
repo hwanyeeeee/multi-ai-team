@@ -130,3 +130,43 @@ def clear_pane(pane_target: str) -> None:
     )
 
 
+def start_interactive(pane_target: str, model_name: str) -> None:
+    """Start an AI CLI in interactive mode in a tmux pane.
+
+    The CLI stays running and maintains its own conversation history.
+    """
+    binary = get_wsl_binary(model_name)
+    interactive_args = " ".join(AI_MODELS[model_name].get("interactive_args", []))
+    cmd = f"{binary} {interactive_args}".strip()
+    subprocess.run(
+        wsl_prefix() + ["tmux", "send-keys", "-t", pane_target, cmd, "Enter"],
+        capture_output=True,
+        timeout=5,
+    )
+
+
+def send_message_to_pane(pane_target: str, message: str) -> None:
+    """Send a chat message to an AI running in interactive mode.
+
+    Uses tmux send-keys to type the message into the CLI's input.
+    """
+    # Escape single quotes for tmux
+    escaped = message.replace("'", "'\\''")
+    subprocess.run(
+        wsl_prefix() + ["tmux", "send-keys", "-t", pane_target, escaped, "Enter"],
+        capture_output=True,
+        timeout=5,
+    )
+
+
+def capture_pane_content(pane_target: str, lines: int = 100) -> str:
+    """Capture visible content from a tmux pane."""
+    result = subprocess.run(
+        wsl_prefix() + ["tmux", "capture-pane", "-t", pane_target, "-p", f"-S", f"-{lines}"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    return result.stdout.strip()
+
+
