@@ -148,12 +148,19 @@ def start_interactive(pane_target: str, model_name: str) -> None:
 def send_message_to_pane(pane_target: str, message: str) -> None:
     """Send a chat message to an AI running in interactive mode.
 
-    Uses tmux send-keys to type the message into the CLI's input.
+    Sends text literally with -l flag, then Enter separately.
+    This ensures TUI-based CLIs (Claude Code, Codex, Gemini) receive
+    the text and submit it correctly.
     """
-    # Escape single quotes for tmux
-    escaped = message.replace("'", "'\\''")
+    # Send text literally (no key name interpretation)
     subprocess.run(
-        wsl_prefix() + ["tmux", "send-keys", "-t", pane_target, escaped, "Enter"],
+        wsl_prefix() + ["tmux", "send-keys", "-t", pane_target, "-l", message],
+        capture_output=True,
+        timeout=5,
+    )
+    # Send Enter key separately to submit
+    subprocess.run(
+        wsl_prefix() + ["tmux", "send-keys", "-t", pane_target, "Enter"],
         capture_output=True,
         timeout=5,
     )
