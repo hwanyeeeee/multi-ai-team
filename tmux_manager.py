@@ -140,8 +140,18 @@ def start_chat_in_pane(
 
 
 def attach_session(session_name: str) -> None:
-    """Attach to a tmux session, replacing the current process."""
-    full_cmd = wsl_prefix() + ["tmux", "attach-session", "-t", session_name]
+    """Attach to a tmux session, replacing the current process.
+
+    If already inside tmux, uses switch-client instead of attach to
+    avoid the 'sessions should be nested' error.
+    """
+    already_in_tmux = bool(os.environ.get("TMUX"))
+    if already_in_tmux:
+        # switch-client works from inside an existing tmux session
+        full_cmd = wsl_prefix() + ["tmux", "switch-client", "-t", session_name]
+    else:
+        full_cmd = wsl_prefix() + ["tmux", "attach-session", "-t", session_name]
+
     if IS_WSL or sys.platform != "win32":
         os.execvp(full_cmd[0], full_cmd)
     else:
