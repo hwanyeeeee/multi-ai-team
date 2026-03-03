@@ -15,6 +15,15 @@ logger = logging.getLogger(__name__)
 # Retry configuration
 MAX_RETRIES = 2  # Maximum additional attempts after first failure
 
+# TUI input timing (for send_message_to_pane)
+HEX_CHUNK_BYTES = 200            # bytes per hex-mode tmux call
+HEX_CHUNK_DELAY_SEC = 0.2        # pause between hex chunks
+POST_TEXT_SETTLE_SEC = 2.0       # wait for TUI to finish rendering before Enter
+ENTER_BASE_DELAY_SEC = 1.0       # initial wait before first Enter
+ENTER_RETRY_BACKOFF_SEC = 1.0    # added per retry attempt
+ENTER_VERIFY_WAIT_SEC = 1.0      # wait after Enter before checking pane
+MAX_ENTER_RETRIES = 3            # max Enter attempts
+
 
 class AIResult(str):
     """String subclass carrying structured metadata about an AI CLI execution.
@@ -305,22 +314,37 @@ def clear_pane(pane_target: str) -> None:
     )
 
 
-def start_interactive(pane_target: str, model_name: str) -> None:
+def start_interactive(pane_target: str, model_name: str, initial_prompt: str = "") -> None:
     """Start an AI CLI in interactive mode in a tmux pane.
 
     The CLI stays running and maintains its own conversation history.
+    If ``initial_prompt`` is provided, it is written to a temp file
+    and passed as the first message via ``$(cat file)`` — this avoids
+    all TUI bracket-paste issues.
     """
     binary = get_wsl_binary(model_name)
     interactive_args = " ".join(AI_MODELS[model_name].get("interactive_args", []))
-    cmd = f"{binary} {interactive_args}".strip()
+
+    if initial_prompt:
+        # Write prompt to temp file (avoids shell escaping issues entirely)
+        prompt_file = f"/tmp/_team_init_{model_name}.txt"
+        subprocess.run(
+            wsl_prefix() + ["bash", "-c", f"cat > {prompt_file}"],
+            input=initial_prompt.encode("utf-8"),
+            capture_output=True, timeout=5,
+        )
+        cmd = f'{binary} {interactive_args} "$(cat {prompt_file})"'
+    else:
+        cmd = f"{binary} {interactive_args}"
+
     subprocess.run(
-        wsl_prefix() + ["tmux", "send-keys", "-t", pane_target, cmd, "Enter"],
+        wsl_prefix() + ["tmux", "send-keys", "-t", pane_target, cmd.strip(), "Enter"],
         capture_output=True,
         timeout=5,
     )
 
 
-def restart_interactive(pane_target: str, model_name: str) -> None:
+def restart_interactive(pane_target: str, model_name: str, initial_prompt: str = "") -> None:
     """Restart an AI CLI in a tmux pane (kill current + start fresh)."""
     # Send exit/quit command to gracefully close
     subprocess.run(
@@ -331,30 +355,57 @@ def restart_interactive(pane_target: str, model_name: str) -> None:
     # Clear pane
     clear_pane(pane_target)
     time.sleep(0.5)
-    # Start fresh
-    start_interactive(pane_target, model_name)
+    # Start fresh (with optional initial prompt)
+    start_interactive(pane_target, model_name, initial_prompt=initial_prompt)
 
 
 def send_message_to_pane(pane_target: str, message: str) -> None:
     """Send a chat message to an AI running in interactive mode.
 
-    Sends text literally with -l flag, pauses briefly so the TUI can
-    process the input, then sends Enter separately.
+    Uses ``tmux send-keys -H`` (hex mode) to send raw bytes directly,
+    completely bypassing bracket-paste mode.  ``send-keys -l`` wraps
+    input in bracket-paste escape sequences which TUI apps (ink/React)
+    may handle incorrectly — swallowing Enter or truncating long text.
+
+    Hex mode sends each byte as-is, so Enter (0x0D) at the end is
+    always delivered as a normal keystroke.
     """
-    # Send text literally (no key name interpretation)
-    subprocess.run(
-        wsl_prefix() + ["tmux", "send-keys", "-t", pane_target, "-l", message],
-        capture_output=True,
-        timeout=5,
-    )
-    # Brief pause so TUI apps (especially Codex) register the text
-    time.sleep(0.2)
-    # Send Enter key separately to submit
-    subprocess.run(
-        wsl_prefix() + ["tmux", "send-keys", "-t", pane_target, "Enter"],
-        capture_output=True,
-        timeout=5,
-    )
+    # Flatten to single line
+    clean = message.replace("\n", " ").replace("\r", " ")
+
+    # Convert entire message to hex bytes
+    hex_bytes = [f"{b:02x}" for b in clean.encode("utf-8")]
+
+    # Send text in hex chunks (bypasses bracket paste entirely)
+    for i in range(0, len(hex_bytes), HEX_CHUNK_BYTES):
+        chunk = hex_bytes[i:i + HEX_CHUNK_BYTES]
+        subprocess.run(
+            wsl_prefix() + ["tmux", "send-keys", "-t", pane_target, "-H"] + chunk,
+            capture_output=True, timeout=10,
+        )
+        if i + HEX_CHUNK_BYTES < len(hex_bytes):
+            time.sleep(HEX_CHUNK_DELAY_SEC)
+
+    # Let TUI fully render the typed input before taking baseline snapshot
+    time.sleep(POST_TEXT_SETTLE_SEC)
+    before = capture_pane_content(pane_target, lines=5)
+
+    # Send Enter (0x0D) with retry — also in hex mode to stay consistent
+    for attempt in range(MAX_ENTER_RETRIES):
+        delay = ENTER_BASE_DELAY_SEC + attempt * ENTER_RETRY_BACKOFF_SEC
+        time.sleep(delay)
+        subprocess.run(
+            wsl_prefix() + ["tmux", "send-keys", "-t", pane_target, "-H", "0d"],
+            capture_output=True, timeout=5,
+        )
+        time.sleep(ENTER_VERIFY_WAIT_SEC)
+        after = capture_pane_content(pane_target, lines=5)
+        if after != before:
+            break  # Content changed — Enter was accepted
+        logger.warning(
+            "send_message_to_pane: Enter attempt %d/%d — pane unchanged, retrying",
+            attempt + 1, MAX_ENTER_RETRIES,
+        )
 
 
 def capture_pane_content(pane_target: str, lines: int = 100) -> str:

@@ -84,30 +84,30 @@ python run.py --no-tmux
 
 `@mention` 없이 메시지를 보내면 키워드로 자동 라우팅된다:
 
-| AI | 키워드 |
-|----|--------|
-| Claude | 설계, 아키텍처, 리뷰, 분석, 추론, 계획 |
-| Codex | 코드, 구현, 함수, 버그, 디버그, 테스트, 리팩토링 |
+| AI     | 키워드                                |
+| ------ | ---------------------------------- |
+| Claude | 설계, 아키텍처, 리뷰, 분석, 추론, 계획           |
+| Codex  | 코드, 구현, 함수, 버그, 디버그, 테스트, 리팩토링     |
 | Gemini | 검색, 리서치, 문서, 프론트엔드, UI, CSS, React |
 
 매칭 없으면 Claude로 기본 라우팅.
 
 ### 슬래시 명령어
 
-| 명령어 | 설명 |
-|--------|------|
-| `/task <설명>` | 자동 오케스트레이션 (계획→배정→탐색→실행→합성) |
-| `/batch <주제>` | AI-to-AI 토론 (자동 수렴 감지) |
-| `/synth` | 모든 AI pane 캡처 후 Claude가 합성 |
-| `/autosynth` | 자동 합성 ON/OFF 토글 |
-| `/events [n]` | 최근 이벤트 스트림 표시 (기본: 20개) |
-| `/models` | 활성 AI 모델 목록 |
-| `/route` | 스마트 라우팅 키워드 표시 |
-| `/history` | 대화 내역 표시 |
-| `/sessions` | 과거 세션 목록 |
-| `/clear` | 대화 로그 초기화 |
-| `/help` | 도움말 표시 |
-| `/quit` | 종료 |
+| 명령어           | 설명                          |
+| ------------- | --------------------------- |
+| `/task <설명>`  | 자동 오케스트레이션 (계획→배정→탐색→실행→합성) |
+| `/batch <주제>` | AI-to-AI 토론 (자동 수렴 감지)      |
+| `/synth`      | 모든 AI pane 캡처 후 Claude가 합성  |
+| `/autosynth`  | 자동 합성 ON/OFF 토글             |
+| `/events [n]` | 최근 이벤트 스트림 표시 (기본: 20개)     |
+| `/models`     | 활성 AI 모델 목록                 |
+| `/route`      | 스마트 라우팅 키워드 표시              |
+| `/history`    | 대화 내역 표시                    |
+| `/sessions`   | 과거 세션 목록                    |
+| `/clear`      | 대화 로그 초기화                   |
+| `/help`       | 도움말 표시                      |
+| `/quit`       | 종료                          |
 
 ## 핵심 기능
 
@@ -122,6 +122,7 @@ Phase 2   — Assign:     Claude가 역할 배정 → 사용자 확인
 Phase 2.5 — Discovery:  각 AI가 구현 전 코드베이스 탐색
 Phase 3   — Execute:    각 AI가 자신의 pane에서 작업 수행
             Synthesize: Claude가 결과를 통합
+            Broadcast:  완료 후 모든 AI pane에 결과 요약 + 세션 경로 전송
 ```
 
 사용 예:
@@ -138,6 +139,7 @@ Round 1 — 각 AI가 초기 의견 제시
 Round 2+ — 다른 AI 의견 분석 후 반응 (Think/Reflection 패턴)
 수렴 체크 — Claude가 합의 여부 판단
 합성 — 최종 결론 도출
+Broadcast — 최종 합성 결과를 모든 AI pane에 전파
 ```
 
 사용 예:
@@ -152,9 +154,22 @@ Round 2+ — 다른 AI 의견 분석 후 반응 (Think/Reflection 패턴)
 
 ### 4. 컨텍스트 자동 관리
 
-각 AI의 컨텍스트 사용량을 주기적으로 모니터링한다.
+각 AI의 컨텍스트 사용량을 주기적으로 모니터링한다 (5 메시지마다 점검).
 - **경고**: 80K 문자 초과 시 알림
 - **자동 리셋**: 150K 문자 초과 시 대화 요약 후 세션 재시작
+- **리셋 복구**: 팀 컨텍스트 + 요약을 CLI 시작 인자로 전달하여 맥락 유지
+
+### 5. TUI 입력 메커니즘
+
+TUI 기반 AI CLI(Claude Code 등)는 `tmux send-keys -l`의 bracket paste 모드를 올바르게 처리하지 못한다.
+이 문제를 해결하기 위해 **hex 모드** (`tmux send-keys -H`)를 사용한다.
+
+- **텍스트 전송**: 메시지를 UTF-8 바이트로 변환 → hex 청크(200바이트)로 분할 전송
+- **Enter 전송**: `0x0D`를 hex로 전송하여 bracket paste 완전 우회
+- **Enter 검증**: 전송 후 pane 내용 변화를 확인하고, 변화 없으면 최대 3회 재시도
+- **초기 컨텍스트**: 긴 팀 컨텍스트는 파일에 쓴 뒤 CLI 시작 인자 `$(cat file)`로 전달
+
+자세한 내부 동작 원리는 [docs/architecture.md](docs/architecture.md) 참조.
 
 ## 적용된 AI 도구 패턴
 
@@ -237,10 +252,13 @@ multi_ai_team/
 ├── config.py           # 설정, 프롬프트 템플릿, 세션 관리
 ├── chat_loop.py        # 대화형 채팅 루프 (tmux input pane)
 ├── orchestrator.py     # /task 오케스트레이터, /batch 토론 엔진
-├── ai_worker.py        # AI CLI 실행, pane 메시지 전송, 유휴 감지
+├── ai_worker.py        # AI CLI 실행, pane 메시지 전송 (hex 모드), 유휴 감지
 ├── tmux_manager.py     # tmux 세션/pane 생성 및 관리
 ├── round_manager.py    # 배치 모드 멀티라운드 프로토콜
 ├── conversation.py     # ConversationLog, SharedContext, EventStream
+├── docs/               # 기술 문서
+│   ├── architecture.md # 시스템 내부 동작 원리
+│   └── protocol.md     # 프로토콜 정의
 └── tests/              # 테스트
     ├── test_config_validation.py
     ├── test_round_manager_flow.py
@@ -249,8 +267,8 @@ multi_ai_team/
 
 ## AI 모델별 역할
 
-| AI | 역할 | 주요 강점 |
-|----|------|----------|
-| Claude | 추론/설계 | 복잡한 추론, 아키텍처, 코드 리뷰, 계획 |
-| Codex | 코드/분석 | 코드 생성, 빠른 반복, 디버깅, 테스트 |
-| Gemini | 리서치/UI | 검색, 긴 컨텍스트, 프론트엔드, 문서화 |
+| AI     | 역할     | 주요 강점                   |
+| ------ | ------ | ----------------------- |
+| Claude | 추론/설계  | 복잡한 추론, 아키텍처, 코드 리뷰, 계획 |
+| Codex  | 코드/분석  | 코드 생성, 빠른 반복, 디버깅, 테스트  |
+| Gemini | 리서치/UI | 검색, 긴 컨텍스트, 프론트엔드, 문서화  |

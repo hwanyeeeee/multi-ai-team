@@ -56,7 +56,7 @@ class ConversationLog:
 class EventStream:
     """Append-only JSONL event log for structured tracking."""
 
-    EVENT_TYPES = ("action", "observation", "message", "status", "error")
+    EVENT_TYPES = frozenset(("action", "observation", "message", "status", "error"))
 
     def __init__(self, work_dir: str):
         self.log_file = get_shared_dir(work_dir) / "events.jsonl"
@@ -69,6 +69,10 @@ class EventStream:
         phase: str = "",
         metadata: dict | None = None,
     ) -> None:
+        if event_type not in self.EVENT_TYPES:
+            raise ValueError(
+                f"Invalid event_type '{event_type}'. Must be one of: {sorted(self.EVENT_TYPES)}"
+            )
         entry = {
             "type": event_type,
             "model": model,

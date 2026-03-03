@@ -48,7 +48,7 @@ AI_MODELS = {
     "gemini": {
         "binary": "gemini",
         "wsl_path": None,
-        "args": ["-p", "--yolo"],  # batch mode
+        "args": ["--yolo", "-p"],  # batch mode — -p must be last (takes prompt as next arg)
         "interactive_args": ["--yolo"],
         "strengths": ["research", "long context", "frontend", "documentation"],
         "label": "Gemini (Research/Frontend)",

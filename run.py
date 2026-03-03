@@ -123,7 +123,7 @@ def run_tmux_chat(work_dir: str) -> None:
     Starts each AI CLI in interactive mode (persistent session),
     then launches the chat loop in the input pane.
     """
-    from ai_worker import start_interactive, send_message_to_pane
+    from ai_worker import start_interactive
     from tmux_manager import (
         create_team_session,
         display_in_pane,
@@ -148,44 +148,36 @@ def run_tmux_chat(work_dir: str) -> None:
     print("Creating tmux session...")
     pane_map = create_team_session(session_name)
 
-    # Start AI CLIs in interactive mode (persistent sessions)
+    # Start AI CLIs in interactive mode with team context as initial prompt.
+    # Passing context via CLI argument (file-based) avoids all TUI
+    # bracket-paste issues that plague tmux send-keys for long text.
     print("Starting AI CLIs in interactive mode...")
     for role in ("claude", "codex", "gemini"):
         pane = pane_map.get(role)
         if pane and role in active:
-            start_interactive(pane, role)
-            print(f"  {AI_MODELS[role]['label']} - started")
+            model_cfg = AI_MODELS[role]
+            # Build teammate list (everyone except this AI)
+            teammates = []
+            for other in active:
+                if other == role:
+                    continue
+                other_cfg = AI_MODELS[other]
+                teammates.append(
+                    f"{other_cfg['label']} ({', '.join(other_cfg['strengths'])})"
+                )
+            context_msg = INTERACTIVE_TEAM_CONTEXT.format(
+                label=model_cfg["label"],
+                strengths=", ".join(model_cfg["strengths"]),
+                teammates=" / ".join(teammates) if teammates else "(solo mode)",
+                name=role,
+            )
+            start_interactive(pane, role, initial_prompt=context_msg)
+            print(f"  {model_cfg['label']} - started")
         elif pane:
             display_in_pane(pane, f"=== {role} (not available) ===")
 
-    # Wait for CLIs to initialize
+    # Wait for CLIs to initialize and process initial context
     time.sleep(3)
-
-    # Send team context to each AI so they know about the collaboration
-    print("Sending team context to each AI...")
-    for role in active:
-        pane = pane_map.get(role)
-        if not pane:
-            continue
-        model_cfg = AI_MODELS[role]
-        # Build teammate list (everyone except this AI)
-        teammates = []
-        for other in active:
-            if other == role:
-                continue
-            other_cfg = AI_MODELS[other]
-            teammates.append(
-                f"{other_cfg['label']} ({', '.join(other_cfg['strengths'])})"
-            )
-        context_msg = INTERACTIVE_TEAM_CONTEXT.format(
-            label=model_cfg["label"],
-            strengths=", ".join(model_cfg["strengths"]),
-            teammates=" / ".join(teammates) if teammates else "(solo mode)",
-            name=role,
-        )
-        send_message_to_pane(pane, context_msg)
-        print(f"  {model_cfg['label']} - team context sent")
-        time.sleep(1)  # stagger to avoid overwhelming tmux
 
     # Launch chat_loop.py in the input pane
     print("Starting chat interface...")

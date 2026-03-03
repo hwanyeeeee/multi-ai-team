@@ -102,6 +102,27 @@ def _print_synthesis(summary: str) -> None:
     console.print(Panel(summary, title="[bold magenta]AI Synthesis[/bold magenta]", border_style="magenta"))
 
 
+def _broadcast_result_to_panes(
+    result: str,
+    context_label: str,
+    pane_map: dict[str, str],
+    active_models: list[str],
+    work_dir: str,
+) -> None:
+    """Send result summary + session path to all AI panes so they have context."""
+    session_dir = str(get_shared_dir(work_dir))
+    # Truncate result to keep the message manageable for TUI input
+    short_result = result[:500] + "..." if len(result) > 500 else result
+    context_msg = (
+        f"[{context_label} Result] Session directory: {session_dir} . "
+        f"Summary: {short_result}"
+    )
+    for model in active_models:
+        pane = pane_map.get(model)
+        if pane:
+            send_message_to_pane(pane, context_msg)
+
+
 def handle_command(
     cmd: str,
     log: ConversationLog,
@@ -169,6 +190,7 @@ def handle_command(
         orch = TaskOrchestrator(pane_map, work_dir, active_models)
         result = orch.run(task_desc)
         _print_synthesis(result)
+        _broadcast_result_to_panes(result, "Task", pane_map, active_models, work_dir)
         # Reset statuses
         for m in active_models:
             if m in pane_map:
@@ -186,6 +208,7 @@ def handle_command(
         disc = BatchDiscussion(work_dir, active_models, pane_map=pane_map)
         result = disc.run(topic)
         _print_synthesis(result)
+        _broadcast_result_to_panes(result, "Batch", pane_map, active_models, work_dir)
         return False
 
     if lower == "/route":
@@ -452,11 +475,10 @@ def run_chat_loop(
                 if context_chars[model] >= CONTEXT_RESET_CHARS:
                     console.print(f"  [bold yellow]⚠ {model} context full, resetting...[/bold yellow]")
                     summary = _summarize_for_reset(model, content, work_dir)
-                    restart_interactive(pane, model)
+                    ctx = _team_context_for(model, active_models)
+                    initial = f"{ctx} [Context Summary] {summary}"
+                    restart_interactive(pane, model, initial_prompt=initial)
                     time.sleep(3)
-                    send_message_to_pane(pane, _team_context_for(model, active_models))
-                    time.sleep(1)
-                    send_message_to_pane(pane, f"[Context Summary] {summary}")
                     context_chars[model] = 0
                 elif context_chars[model] >= CONTEXT_WARNING_CHARS:
                     console.print(

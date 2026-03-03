@@ -256,6 +256,7 @@ class TaskOrchestrator:
 
         # Fallback: if parsing failed, assign the task description directly
         if not assignments:
+            self._notify("Assign", "Warning: could not parse role assignments, using fallback", style="yellow")
             for model in self.active_models:
                 assignments[model] = raw_text.strip()[:500]
 
@@ -327,8 +328,7 @@ class BatchDiscussion:
                     history=self._format_history(),
                 )
             out_file = str(
-                Path(self.work_dir)
-                / "shared"
+                get_shared_dir(self.work_dir)
                 / f"batch_r{round_num}_{model}.md"
             )
             result = run_ai_cli(model, prompt, self.work_dir, out_file)
