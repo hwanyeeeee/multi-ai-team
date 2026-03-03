@@ -29,6 +29,10 @@ from config import (
     ROUNDS,
     TMUX_SESSION_PREFIX,
     AI_RESPONSE_TIMEOUT_SEC,
+    INTERACTIVE_TEAM_CONTEXT,
+    create_session_dir,
+    get_shared_dir,
+    update_session_meta,
     detect_available_models,
     validate_config,
     wsl_prefix,
@@ -74,6 +78,9 @@ def get_active_models() -> list[str]:
 
 def run_batch_mode(task: str, work_dir: str) -> str:
     """Run without tmux - sequential batch execution."""
+    # Create a timestamped session directory for this batch run
+    create_session_dir(work_dir)
+    update_session_meta(models=get_active_models(), topic=task[:50])
     rm = RoundManager(task, work_dir, active_models=get_active_models())
 
     print(f"\n{'='*60}")
@@ -103,7 +110,7 @@ def run_batch_mode(task: str, work_dir: str) -> str:
     summary = rm.generate_summary()
 
     # Save final report
-    report_file = Path(work_dir) / "shared" / "final_report.md"
+    report_file = get_shared_dir(work_dir) / "final_report.md"
     report_file.write_text(summary, encoding="utf-8")
     print(f"\nFinal report saved to: {report_file}")
 
@@ -116,7 +123,7 @@ def run_tmux_chat(work_dir: str) -> None:
     Starts each AI CLI in interactive mode (persistent session),
     then launches the chat loop in the input pane.
     """
-    from ai_worker import start_interactive
+    from ai_worker import start_interactive, send_message_to_pane
     from tmux_manager import (
         create_team_session,
         display_in_pane,
@@ -126,6 +133,10 @@ def run_tmux_chat(work_dir: str) -> None:
 
     session_name = f"{TMUX_SESSION_PREFIX}-{int(time.time()) % 10000}"
     active = get_active_models()
+
+    # Create a timestamped session directory for all shared files
+    session_dir = create_session_dir(work_dir)
+    update_session_meta(models=active)
 
     print(f"\n{'='*60}")
     print(f"  Multi-AI Team - Interactive Chat")
@@ -148,11 +159,37 @@ def run_tmux_chat(work_dir: str) -> None:
             display_in_pane(pane, f"=== {role} (not available) ===")
 
     # Wait for CLIs to initialize
-    time.sleep(2)
+    time.sleep(3)
+
+    # Send team context to each AI so they know about the collaboration
+    print("Sending team context to each AI...")
+    for role in active:
+        pane = pane_map.get(role)
+        if not pane:
+            continue
+        model_cfg = AI_MODELS[role]
+        # Build teammate list (everyone except this AI)
+        teammates = []
+        for other in active:
+            if other == role:
+                continue
+            other_cfg = AI_MODELS[other]
+            teammates.append(
+                f"{other_cfg['label']} ({', '.join(other_cfg['strengths'])})"
+            )
+        context_msg = INTERACTIVE_TEAM_CONTEXT.format(
+            label=model_cfg["label"],
+            strengths=", ".join(model_cfg["strengths"]),
+            teammates=" / ".join(teammates) if teammates else "(solo mode)",
+            name=role,
+        )
+        send_message_to_pane(pane, context_msg)
+        print(f"  {model_cfg['label']} - team context sent")
+        time.sleep(1)  # stagger to avoid overwhelming tmux
 
     # Launch chat_loop.py in the input pane
     print("Starting chat interface...")
-    start_chat_in_pane(session_name, pane_map["input"], work_dir, active)
+    start_chat_in_pane(session_name, pane_map["input"], work_dir, active, str(session_dir))
 
     time.sleep(0.5)
 

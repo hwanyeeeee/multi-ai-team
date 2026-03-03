@@ -1,12 +1,13 @@
 """AI Worker - runs CLI commands for each AI model."""
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import os
 import subprocess
 import time
 from pathlib import Path
-from config import AI_MODELS, AI_RESPONSE_TIMEOUT_SEC, IS_WSL, get_wsl_binary, to_wsl_path, wsl_prefix
+from config import AI_MODELS, AI_RESPONSE_TIMEOUT_SEC, IS_WSL, get_shared_dir, get_wsl_binary, to_wsl_path, wsl_prefix
 from tmux_manager import update_pane_status
 
 logger = logging.getLogger(__name__)
@@ -111,7 +112,7 @@ def run_ai_cli(model_name: str, prompt: str, work_dir: str, output_file: str) ->
     binary = get_wsl_binary(model_name)
 
     # Write prompt to file to avoid shell escaping issues
-    prompt_file = str(Path(work_dir) / "shared" / f"{model_name}_batch_prompt.txt")
+    prompt_file = str(get_shared_dir(work_dir) / f"{model_name}_batch_prompt.txt")
     Path(prompt_file).parent.mkdir(parents=True, exist_ok=True)
     Path(prompt_file).write_text(prompt, encoding="utf-8")
 
@@ -195,15 +196,16 @@ def run_ai_in_tmux_pane(
     prompt: str,
     output_file: str,
     work_dir: str,
-) -> None:
-    """
-    Send AI CLI command to a tmux pane so the user can see it running.
-    Output is tee'd to a file for collection.
+) -> str:
+    """Send AI CLI command to a tmux pane so the user can see it running.
+
+    Output is tee'd to a file for collection.  Returns the tmux wait-for
+    signal name that the caller should wait on.
     """
     args = " ".join(AI_MODELS[model_name]["args"])
 
     # Write prompt to a temp file (avoids shell escaping issues)
-    prompt_file = str(Path(work_dir) / "shared" / f"{model_name}_prompt.txt")
+    prompt_file = str(get_shared_dir(work_dir) / f"{model_name}_prompt.txt")
     Path(prompt_file).parent.mkdir(parents=True, exist_ok=True)
     Path(prompt_file).write_text(prompt, encoding="utf-8")
 
@@ -211,11 +213,14 @@ def run_ai_in_tmux_pane(
     tmux_prompt = prompt_file if IS_WSL else to_wsl_path(prompt_file)
     tmux_output = output_file if IS_WSL else to_wsl_path(output_file)
 
+    # Build a unique tmux wait-for signal name
+    signal = f"done-{model_name}-{pane_target.replace('.', '-')}"
+
     # Use absolute binary path to avoid PATH issues
     binary = get_wsl_binary(model_name)
     tmux_cmd = (
         f'{binary} {args} "$(cat {tmux_prompt})" 2>&1 | tee {tmux_output}'
-        f' && echo "===DONE===" >> {tmux_output}'
+        f' ; tmux wait-for -S {signal}'
     )
 
     # Send to tmux pane
@@ -225,53 +230,68 @@ def run_ai_in_tmux_pane(
         wsl_prefix() + ["tmux", "send-keys", "-t", pane_target, escaped, "Enter"],
         timeout=5,
     )
+    return signal
 
 
-def wait_for_completion(output_files: dict[str, str], timeout: int = AI_RESPONSE_TIMEOUT_SEC) -> dict[str, AIResult]:
-    """Wait for all AI workers to complete by checking for ===DONE=== marker.
+def wait_for_signals(
+    signals: dict[str, str],
+    output_files: dict[str, str],
+    pane_targets: dict[str, str] | None = None,
+    timeout: int = AI_RESPONSE_TIMEOUT_SEC,
+) -> dict[str, AIResult]:
+    """Wait for tmux wait-for signals from each pane (no polling).
+
+    ``signals`` maps model_name -> signal_name (returned by
+    ``run_ai_in_tmux_pane``).  ``output_files`` maps model_name -> output
+    file path used to read the result after the signal fires.
 
     Returns dict of model_name -> :class:`AIResult`.
     """
     results: dict[str, AIResult] = {}
-    start = time.time()
 
-    pending = set(output_files.keys())
-
-    while pending and (time.time() - start) < timeout:
-        for model_name in list(pending):
-            fpath = output_files[model_name]
-            if os.path.exists(fpath):
-                content = Path(fpath).read_text(encoding="utf-8", errors="replace")
-                if "===DONE===" in content:
-                    clean = content.replace("===DONE===", "").strip()
-                    results[model_name] = AIResult(
-                        clean, success=True, model_name=model_name,
-                    )
-                    pending.discard(model_name)
-        if pending:
-            time.sleep(2)
-
-    # Handle timeouts with structured error objects
-    elapsed = int(time.time() - start)
-    for model_name in pending:
-        fpath = output_files[model_name]
-        if os.path.exists(fpath):
-            partial = Path(fpath).read_text(encoding="utf-8", errors="replace").strip()
-            results[model_name] = AIResult(
-                partial,
-                success=False,
-                model_name=model_name,
-                error_type="timeout_partial",
-                error_detail=f"partial output after {elapsed}s (limit {timeout}s)",
+    def _wait_one(model: str, signal: str) -> tuple[str, AIResult]:
+        try:
+            subprocess.run(
+                wsl_prefix() + ["tmux", "wait-for", signal],
+                timeout=timeout,
             )
-        else:
-            results[model_name] = AIResult(
-                f"[timeout] {model_name}: no response after {elapsed}s (limit {timeout}s)",
-                success=False,
-                model_name=model_name,
+            # Signal received — read output file
+            fpath = output_files.get(model, "")
+            if fpath and os.path.exists(fpath):
+                content = Path(fpath).read_text(encoding="utf-8", errors="replace").strip()
+                if pane_targets and model in pane_targets:
+                    update_pane_status(pane_targets[model], model, "완료")
+                return model, AIResult(content, success=True, model_name=model)
+            return model, AIResult(
+                f"[error] {model}: signal received but output file missing",
+                success=False, model_name=model,
+                error_type="missing_output", error_detail="no output file after signal",
+            )
+        except subprocess.TimeoutExpired:
+            fpath = output_files.get(model, "")
+            partial = ""
+            if fpath and os.path.exists(fpath):
+                partial = Path(fpath).read_text(encoding="utf-8", errors="replace").strip()
+            if pane_targets and model in pane_targets:
+                update_pane_status(pane_targets[model], model, "에러")
+            if partial:
+                return model, AIResult(
+                    partial, success=False, model_name=model,
+                    error_type="timeout_partial",
+                    error_detail=f"partial output after {timeout}s",
+                )
+            return model, AIResult(
+                f"[timeout] {model}: no response within {timeout}s",
+                success=False, model_name=model,
                 error_type="timeout",
-                error_detail=f"no output file after {elapsed}s",
+                error_detail=f"exceeded {timeout}s",
             )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(signals)) as pool:
+        futures = {pool.submit(_wait_one, m, s): m for m, s in signals.items()}
+        for f in concurrent.futures.as_completed(futures):
+            model, result = f.result()
+            results[model] = result
 
     return results
 
@@ -298,6 +318,21 @@ def start_interactive(pane_target: str, model_name: str) -> None:
         capture_output=True,
         timeout=5,
     )
+
+
+def restart_interactive(pane_target: str, model_name: str) -> None:
+    """Restart an AI CLI in a tmux pane (kill current + start fresh)."""
+    # Send exit/quit command to gracefully close
+    subprocess.run(
+        wsl_prefix() + ["tmux", "send-keys", "-t", pane_target, "/exit", "Enter"],
+        capture_output=True, timeout=5,
+    )
+    time.sleep(2)
+    # Clear pane
+    clear_pane(pane_target)
+    time.sleep(0.5)
+    # Start fresh
+    start_interactive(pane_target, model_name)
 
 
 def send_message_to_pane(pane_target: str, message: str) -> None:
@@ -336,7 +371,9 @@ def capture_pane_content(pane_target: str, lines: int = 100) -> str:
 def wait_for_all_panes_idle(
     pane_targets: dict[str, str],
     stable_secs: int = 5,
-    timeout: int = 90,
+    timeout: int = 1800,
+    min_poll: float = 1.0,
+    max_poll: float = 5.0,
 ) -> dict[str, str]:
     """Wait for multiple tmux panes to stop changing, then capture content.
 
@@ -344,7 +381,8 @@ def wait_for_all_panes_idle(
     1. Wait for each pane's content to CHANGE (AI started responding).
     2. Then wait for it to STABILIZE (AI finished responding).
 
-    This prevents premature idle detection when an AI hasn't started yet.
+    Polling interval increases gradually from ``min_poll`` to ``max_poll``
+    (exponential backoff, factor 1.5) to reduce subprocess overhead.
     """
     start = time.time()
     initial_contents: dict[str, str] = {}
@@ -352,6 +390,7 @@ def wait_for_all_panes_idle(
     last_changes: dict[str, float] = {}
     started: set[str] = set()  # AIs that have started responding
     done: set[str] = set()     # AIs that have finished responding
+    poll_interval = min_poll
 
     # Snapshot current state BEFORE AI starts responding
     for name, pane in pane_targets.items():
@@ -364,6 +403,7 @@ def wait_for_all_panes_idle(
     time.sleep(1)
 
     while (time.time() - start) < timeout and len(done) < len(pane_targets):
+        changed_this_cycle = False
         for name, pane in pane_targets.items():
             if name in done:
                 continue
@@ -376,17 +416,27 @@ def wait_for_all_panes_idle(
                     last_contents[name] = content
                     last_changes[name] = time.time()
                     update_pane_status(pane, name, "실행중")
+                    changed_this_cycle = True
             else:
                 # Phase 2: waiting for content to stabilize
                 if content != last_contents[name]:
                     last_contents[name] = content
                     last_changes[name] = time.time()
+                    changed_this_cycle = True
                 elif (time.time() - last_changes[name]) >= stable_secs:
                     done.add(name)
                     update_pane_status(pane, name, "완료")
 
         if len(done) < len(pane_targets):
-            time.sleep(2)
+            time.sleep(poll_interval)
+            if changed_this_cycle:
+                # Reset to fast polling when activity detected
+                poll_interval = min_poll
+            else:
+                # Gradually increase interval when idle
+                poll_interval = min(poll_interval * 1.5, max_poll)
+        else:
+            break  # All done — return immediately
 
     # For AIs that started but didn't stabilize, use last captured content
     # For AIs that never started, use initial content
@@ -424,7 +474,7 @@ def synthesize_responses(
         "Keep it under 300 words. Respond in the same language as the user question."
     )
 
-    output_file = str(Path(work_dir) / "shared" / "synthesis.md")
+    output_file = str(get_shared_dir(work_dir) / "synthesis.md")
     return run_ai_cli("claude", prompt, work_dir, output_file)
 
 

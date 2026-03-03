@@ -143,7 +143,11 @@ def kill_session(session_name: str) -> None:
 
 
 def start_chat_in_pane(
-    session_name: str, pane_target: str, work_dir: str, active_models: list[str]
+    session_name: str,
+    pane_target: str,
+    work_dir: str,
+    active_models: list[str],
+    session_dir: str = "",
 ) -> None:
     """Launch chat_loop.py in the input pane."""
     script = str((Path(__file__).parent / "chat_loop.py").resolve())
@@ -152,9 +156,11 @@ def start_chat_in_pane(
     if IS_WSL:
         wsl_script = script
         wsl_work_dir = work_dir
+        wsl_session_dir = session_dir
     else:
         wsl_script = to_wsl_path(script)
         wsl_work_dir = to_wsl_path(work_dir)
+        wsl_session_dir = to_wsl_path(session_dir) if session_dir else ""
 
     cmd = (
         f"python3 {wsl_script}"
@@ -162,6 +168,8 @@ def start_chat_in_pane(
         f" --work-dir {shlex.quote(wsl_work_dir)}"
         f" --models {shlex.quote(models_json)}"
     )
+    if wsl_session_dir:
+        cmd += f" --session-dir {shlex.quote(wsl_session_dir)}"
     run_tmux(["send-keys", "-t", pane_target, cmd, "Enter"])
 
 

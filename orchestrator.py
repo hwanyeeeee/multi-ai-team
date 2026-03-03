@@ -11,22 +11,29 @@ import re
 import concurrent.futures
 from pathlib import Path
 
+from rich.console import Console
+
 from config import (
     AI_MODELS,
     ORCH_PLAN_PROMPT,
     ORCH_ASSIGN_PROMPT,
+    ORCH_DISCOVER_PROMPT,
     ORCH_FINAL_PROMPT,
     BATCH_OPEN_PROMPT,
     BATCH_REPLY_PROMPT,
     BATCH_CONSENSUS_PROMPT,
     BATCH_SYNTHESIS_PROMPT,
+    get_shared_dir,
 )
 from ai_worker import (
     run_ai_cli,
     send_message_to_pane,
     wait_for_all_panes_idle,
 )
-from conversation import SharedContext
+from tmux_manager import display_in_pane
+from conversation import SharedContext, EventStream
+
+console = Console()
 
 
 class TaskOrchestrator:
@@ -42,27 +49,75 @@ class TaskOrchestrator:
         self.work_dir = work_dir
         self.active_models = active_models
         self.shared_ctx = SharedContext(work_dir)
+        self.events = EventStream(work_dir)
 
     def run(self, task: str) -> str:
-        """Full orchestration pipeline: plan -> assign -> execute."""
+        """Full orchestration pipeline: plan -> assign -> discover -> execute."""
+        self.events.log("status", detail=f"Task started: {task[:80]}", phase="start")
+
         # Phase 1: Planning
         plans = self._plan(task)
         if not plans:
+            self.events.log("error", detail="No plans received", phase="plan")
             return "[Error] No plans received from any AI."
 
         # Phase 2: Role assignment + user confirmation
         assignments = self._assign(task, plans)
         if assignments is None:
+            self.events.log("status", detail="User declined", phase="assign")
             return "[Cancelled] User declined the task plan."
+
+        # Create todo.md checklist
+        self._create_todo(task, assignments)
+
+        # Phase 2.5: Discovery
+        self._discover(assignments)
 
         # Phase 3: Execute + synthesize
         return self._execute(task, assignments)
+
+    # -- Helpers ------------------------------------------------------------
+
+    def _notify(self, phase: str, detail: str, style: str = "blue") -> None:
+        """Print structured progress notification."""
+        console.print(f"  [{style}][{phase}][/{style}] {detail}")
+        self.events.log("status", detail=detail, phase=phase)
+
+    def _create_todo(self, task: str, assignments: dict[str, str]) -> Path:
+        """Create shared todo.md checklist from assignments."""
+        todo_path = get_shared_dir(self.work_dir) / "todo.md"
+        lines = [f"# Task: {task}\n"]
+        for model, instruction in assignments.items():
+            label = AI_MODELS[model]["label"]
+            short = instruction[:80]
+            lines.append(f"- [ ] {label}: {short}")
+        lines.append("")
+        todo_path.write_text("\n".join(lines), encoding="utf-8")
+        self._notify("Todo", "Checklist created: todo.md", style="green")
+        return todo_path
+
+    def _discover(self, assignments: dict[str, str]) -> dict[str, str]:
+        """Phase 2.5: Each AI explores scope before executing."""
+        self._notify("Phase 2.5", "Discovery - exploring codebase...")
+        for model, instruction in assignments.items():
+            pane = self.pane_map.get(model)
+            if pane:
+                discover_msg = ORCH_DISCOVER_PROMPT.format(
+                    label=AI_MODELS[model]["label"],
+                    instruction=instruction,
+                )
+                send_message_to_pane(pane, discover_msg)
+                self.events.log("action", model=model, detail="Discovery sent", phase="discover")
+        pane_targets = {m: self.pane_map[m] for m in assignments if m in self.pane_map}
+        results = wait_for_all_panes_idle(pane_targets, stable_secs=5, timeout=120)
+        self._notify("Phase 2.5", "Discovery complete", style="green")
+        return results
 
     # -- Phase 1: Planning --------------------------------------------------
 
     def _plan(self, task: str) -> dict[str, str]:
         """Ask each AI to draft a plan (batch, parallel)."""
-        print(f"\n  [Phase 1/3] Planning - each AI drafting a plan...")
+        self._notify("Phase 1/3", "Planning - each AI drafting a plan...")
 
         def _get_plan(model: str) -> tuple[str, str]:
             cfg = AI_MODELS[model]
@@ -71,7 +126,7 @@ class TaskOrchestrator:
                 strengths=", ".join(cfg["strengths"]),
                 task=task,
             )
-            out_file = str(Path(self.work_dir) / "shared" / f"orch_plan_{model}.md")
+            out_file = str(get_shared_dir(self.work_dir) / f"orch_plan_{model}.md")
             result = run_ai_cli(model, prompt, self.work_dir, out_file)
             return model, result
 
@@ -93,7 +148,7 @@ class TaskOrchestrator:
 
     def _assign(self, task: str, plans: dict[str, str]) -> dict[str, str] | None:
         """Have Claude assign roles based on plans. Returns None if user declines."""
-        print(f"\n  [Phase 2/3] Assigning Roles...")
+        self._notify("Phase 2/3", "Assigning Roles...")
 
         # Build combined plans text
         all_plans = "\n\n".join(
@@ -107,7 +162,7 @@ class TaskOrchestrator:
             model_strengths=self._format_strengths(),
             active_models=", ".join(self.active_models),
         )
-        out_file = str(Path(self.work_dir) / "shared" / "orch_assign.md")
+        out_file = str(get_shared_dir(self.work_dir) / "orch_assign.md")
         raw = run_ai_cli("claude", prompt, self.work_dir, out_file)
 
         assignments = self._parse_assignments(raw)
@@ -135,16 +190,22 @@ class TaskOrchestrator:
 
     def _execute(self, task: str, assignments: dict[str, str]) -> str:
         """Send instructions to panes, wait for responses, synthesize."""
-        print(f"\n  [Phase 3/3] Executing...")
+        self._notify("Phase 3/3", "Executing...")
 
-        # Send instructions to each AI's interactive pane
+        # Send instructions to each AI's interactive pane (with todo.md reference)
         sent_models = []
         for model, instruction in assignments.items():
             pane = self.pane_map.get(model)
             if pane:
-                send_message_to_pane(pane, instruction)
+                full_instruction = (
+                    f"{instruction}\n\n"
+                    "Refer to todo.md in the shared directory for the full task checklist. "
+                    "Follow existing code conventions in the project."
+                )
+                send_message_to_pane(pane, full_instruction)
                 label = AI_MODELS[model]["label"]
-                print(f"    -> {label}: Delegated")
+                self._notify("Execute", f"-> {label}: Delegated", style="cyan")
+                self.events.log("action", model=model, detail="Task delegated", phase="execute")
                 sent_models.append(model)
 
         if not sent_models:
@@ -153,7 +214,7 @@ class TaskOrchestrator:
         # Wait for all panes to finish
         print("    Waiting for AI responses...")
         pane_targets = {m: self.pane_map[m] for m in sent_models if m in self.pane_map}
-        responses = wait_for_all_panes_idle(pane_targets, timeout=120)
+        responses = wait_for_all_panes_idle(pane_targets, timeout=1800)
 
         # Build results text
         all_results = "\n\n".join(
@@ -174,10 +235,8 @@ class TaskOrchestrator:
             assignments=assign_text,
             all_results=all_results,
         )
-        out_file = str(Path(self.work_dir) / "shared" / "orch_final.md")
+        out_file = str(get_shared_dir(self.work_dir) / "orch_final.md")
         return run_ai_cli("claude", prompt, self.work_dir, out_file)
-
-    # -- Helpers ------------------------------------------------------------
 
     def _parse_assignments(self, raw_text: str) -> dict[str, str]:
         """Parse '[model] instruction' lines from Claude's response.
@@ -217,20 +276,22 @@ class BatchDiscussion:
 
     MAX_ROUNDS = 5
 
-    def __init__(self, work_dir: str, active_models: list[str]):
+    def __init__(self, work_dir: str, active_models: list[str], pane_map: dict[str, str] | None = None):
         self.work_dir = work_dir
         self.active_models = active_models
+        self.pane_map = pane_map or {}
         self.history: list[dict[str, str]] = []  # [{model: response}, ...]
         self.shared_ctx = SharedContext(work_dir)
+        self.events = EventStream(work_dir)
 
     def run(self, topic: str) -> str:
         """Run discussion until convergence or max rounds."""
+        self.events.log("status", detail=f"Batch started: {topic[:80]}", phase="batch_start")
         for round_num in range(1, self.MAX_ROUNDS + 1):
-            print(f"\n  [Round {round_num}/{self.MAX_ROUNDS}] ", end="")
             if round_num == 1:
-                print("각 AI 의견 제시 중...")
+                console.print(f"\n  [blue][Round {round_num}/{self.MAX_ROUNDS}][/blue] 각 AI 의견 제시 중...")
             else:
-                print("서로의 의견에 반응 중...")
+                console.print(f"\n  [blue][Round {round_num}/{self.MAX_ROUNDS}][/blue] 서로의 의견에 반응 중...")
 
             responses = self._discuss_round(topic, round_num)
             self.history.append(responses)
@@ -293,6 +354,13 @@ class BatchDiscussion:
                 self.shared_ctx.add_response(
                     model, result, round_name=f"batch_r{round_num}",
                 )
+                # Show progress in the AI's tmux pane
+                if self.pane_map and model in self.pane_map:
+                    chars = len(result)
+                    display_in_pane(
+                        self.pane_map[model],
+                        f"[Batch R{round_num}] Done ({chars} chars)",
+                    )
 
         return responses
 
@@ -303,7 +371,7 @@ class BatchDiscussion:
             history=self._format_history(),
         )
         out_file = str(
-            Path(self.work_dir) / "shared" / "batch_consensus.md"
+            get_shared_dir(self.work_dir) / "batch_consensus.md"
         )
         result = run_ai_cli("claude", prompt, self.work_dir, out_file)
 
@@ -324,7 +392,7 @@ class BatchDiscussion:
             history=self._format_history(),
         )
         out_file = str(
-            Path(self.work_dir) / "shared" / "batch_synthesis.md"
+            get_shared_dir(self.work_dir) / "batch_synthesis.md"
         )
         return run_ai_cli("claude", prompt, self.work_dir, out_file)
 

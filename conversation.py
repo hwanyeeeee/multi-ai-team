@@ -5,15 +5,14 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from config import AI_MODELS
+from config import AI_MODELS, get_shared_dir
 
 
 class ConversationLog:
     """Lightweight log of user messages for /history and JSONL persistence."""
 
     def __init__(self, work_dir: str):
-        shared_dir = Path(work_dir) / "shared"
-        shared_dir.mkdir(parents=True, exist_ok=True)
+        shared_dir = get_shared_dir(work_dir)
         self.log_file = shared_dir / "chat.jsonl"
         self.entries: list[dict] = []
 
@@ -54,6 +53,40 @@ class ConversationLog:
         self.entries.clear()
 
 
+class EventStream:
+    """Append-only JSONL event log for structured tracking."""
+
+    EVENT_TYPES = ("action", "observation", "message", "status", "error")
+
+    def __init__(self, work_dir: str):
+        self.log_file = get_shared_dir(work_dir) / "events.jsonl"
+
+    def log(
+        self,
+        event_type: str,
+        model: str = "",
+        detail: str = "",
+        phase: str = "",
+        metadata: dict | None = None,
+    ) -> None:
+        entry = {
+            "type": event_type,
+            "model": model,
+            "detail": detail,
+            "phase": phase,
+            "timestamp": datetime.now().isoformat(),
+            "metadata": metadata or {},
+        }
+        with open(self.log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def recent(self, n: int = 20) -> list[dict]:
+        if not self.log_file.exists():
+            return []
+        lines = self.log_file.read_text(encoding="utf-8").strip().splitlines()
+        return [json.loads(line) for line in lines[-n:]]
+
+
 class SharedContext:
     """Structured context manager for passing AI responses between agents.
 
@@ -72,8 +105,7 @@ class SharedContext:
     """
 
     def __init__(self, work_dir: str):
-        shared_dir = Path(work_dir) / "shared"
-        shared_dir.mkdir(parents=True, exist_ok=True)
+        shared_dir = get_shared_dir(work_dir)
         self.context_file = shared_dir / "shared_context.json"
         self._responses: list[dict] = []
         self._load()

@@ -5,7 +5,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
-from config import ROUNDS, AI_MODELS
+from config import ROUNDS, AI_MODELS, get_shared_dir
 
 
 class RoundManager:
@@ -14,8 +14,7 @@ class RoundManager:
     def __init__(self, task: str, work_dir: str, active_models: list[str] | None = None):
         self.task = task
         self.work_dir = Path(work_dir)
-        self.shared_dir = self.work_dir / "shared"
-        self.shared_dir.mkdir(parents=True, exist_ok=True)
+        self.shared_dir = get_shared_dir(work_dir)
         self.chat_log = self.shared_dir / "chat.jsonl"
         self.round_results: dict[int, dict[str, str]] = {}
         self.active_models = active_models or list(AI_MODELS.keys())

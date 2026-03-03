@@ -1,9 +1,11 @@
 """Configuration for Multi-AI Team system."""
 from __future__ import annotations
 
+import json
 import os
 import platform
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -30,7 +32,7 @@ AI_MODELS = {
     "claude": {
         "binary": "claude",
         "wsl_path": None,  # Resolved at runtime by detect_available_models()
-        "args": ["--print"],  # batch mode (one-shot)
+        "args": ["--print", "--dangerously-skip-permissions"],  # batch mode (one-shot)
         "interactive_args": ["--dangerously-skip-permissions"],
         "strengths": ["complex reasoning", "architecture", "code review", "planning"],
         "label": "Claude (Reasoning/Architecture)",
@@ -38,15 +40,15 @@ AI_MODELS = {
     "codex": {
         "binary": "codex",
         "wsl_path": None,
-        "args": ["exec", "--skip-git-repo-check"],  # batch mode
-        "interactive_args": ["--full-auto"],
+        "args": ["exec", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox"],  # batch mode
+        "interactive_args": ["--dangerously-bypass-approvals-and-sandbox"],
         "strengths": ["code generation", "fast iteration", "debugging", "testing"],
         "label": "Codex (Code/Analysis)",
     },
     "gemini": {
         "binary": "gemini",
         "wsl_path": None,
-        "args": ["-p"],  # batch mode
+        "args": ["-p", "--yolo"],  # batch mode
         "interactive_args": ["--yolo"],
         "strengths": ["research", "long context", "frontend", "documentation"],
         "label": "Gemini (Research/Frontend)",
@@ -145,11 +147,43 @@ ROUNDS = [
     },
 ]
 
+# Keyword-to-model routing for smart message dispatch
+SMART_ROUTING_KEYWORDS: dict[str, list[str]] = {
+    "claude": [
+        "설계", "아키텍처", "architecture", "design", "plan", "계획",
+        "리뷰", "review", "분석", "analyze", "reason", "추론", "왜",
+    ],
+    "codex": [
+        "코드", "code", "구현", "implement", "작성", "write", "함수",
+        "function", "버그", "bug", "fix", "수정", "디버그", "debug",
+        "테스트", "test", "리팩토링", "refactor",
+    ],
+    "gemini": [
+        "검색", "search", "research", "조사", "문서", "doc", "documentation",
+        "프론트", "frontend", "UI", "css", "html", "react", "컴포넌트",
+    ],
+}
+DEFAULT_ROUTE_MODEL = "claude"  # fallback when no keyword matches
+
+# Context management thresholds (characters)
+# Approximate: 1 token ≈ 4 chars for English, ≈ 2 chars for Korean
+CONTEXT_WARNING_CHARS = 80000      # ~20K tokens, warn user
+CONTEXT_RESET_CHARS = 150000       # ~37K tokens, auto-reset
+CONTEXT_CHECK_INTERVAL = 5         # check every N messages
+
+CONTEXT_RESET_SUMMARY_PROMPT = (
+    "Below is a conversation history from {label}. "
+    "Summarize the key context, decisions, and current task state in under 200 words. "
+    "This summary will be used to restore context after a session reset. "
+    "Focus on: what task is being worked on, what was decided, what remains to do.\n\n"
+    "{conversation}"
+)
+
 # Tmux settings
 TMUX_SESSION_PREFIX = "multi-ai-team"
 
 # Timeouts
-AI_RESPONSE_TIMEOUT_SEC = 120
+AI_RESPONSE_TIMEOUT_SEC = 1800
 
 # Chat mode settings
 CHAT_HISTORY_MAX_CHARS = 8000
@@ -178,6 +212,16 @@ ORCH_ASSIGN_PROMPT = (
     "[gemini] Specific instruction for Gemini\n\n"
     "Each instruction should be a clear, actionable directive.\n"
     "Only assign tasks to available AIs: {active_models}\n"
+    "IMPORTANT: Follow existing code conventions — match the project's naming style, "
+    "formatting, and patterns. Do not introduce new styles.\n"
+    "Respond in the same language as the task."
+)
+
+ORCH_DISCOVER_PROMPT = (
+    "You are {label}. Before implementing, explore the codebase first.\n"
+    "Your assigned task: {instruction}\n\n"
+    "List the files, functions, and dependencies you need to understand.\n"
+    "Identify potential risks or blockers. Keep it under 150 words.\n"
     "Respond in the same language as the task."
 )
 
@@ -206,10 +250,28 @@ BATCH_REPLY_PROMPT = (
     "Your strengths: {strengths}\n\n"
     "Topic: {topic}\n\n"
     "Previous discussion:\n{history}\n\n"
-    "Respond to the other AIs' points.\n"
-    "Agree, disagree, or build on their ideas. Be specific.\n"
-    "Keep it under 200 words.\n"
+    "Before responding, analyze the other AIs' arguments:\n"
+    "1. What are the strongest points from each AI?\n"
+    "2. Where do you agree or disagree, and why?\n"
+    "3. What perspectives are missing?\n\n"
+    "Then provide your response, building on this analysis.\n"
+    "Be specific and constructive. Keep it under 250 words.\n"
     "Respond in the same language as the topic."
+)
+
+# Team context sent to each AI when starting interactive mode.
+# IMPORTANT: Must be a single line — tmux send-keys treats \n as Enter,
+# which would submit partial messages in TUI-based CLIs.
+INTERACTIVE_TEAM_CONTEXT = (
+    "[Team Context] You are {label}, part of a multi-AI collaboration team. "
+    "Your strengths: {strengths}. "
+    "Teammates: {teammates}. "
+    "A human operator sends messages from the chat pane and may address you with @{name}. "
+    "Other AIs cannot see your responses directly — the operator relays context or uses /synth. "
+    "Focus on YOUR strengths; if a task suits a teammate better, say so. "
+    "IMPORTANT: Follow existing code conventions — match naming style, formatting, and patterns already in the project. "
+    "Be concise and actionable. Respond in the same language as the operator. "
+    "Acknowledge briefly that you are ready."
 )
 
 BATCH_CONSENSUS_PROMPT = (
@@ -226,6 +288,76 @@ BATCH_SYNTHESIS_PROMPT = (
     "Include: key agreements, remaining disagreements, and actionable conclusions.\n"
     "Respond in the same language as the topic."
 )
+
+
+# ---------------------------------------------------------------------------
+# Session directory management
+# ---------------------------------------------------------------------------
+_current_session_dir: Path | None = None
+
+
+def create_session_dir(work_dir: str) -> Path:
+    """Create a timestamped session directory under shared/.
+
+    Called once at session start.  All subsequent ``get_shared_dir()`` calls
+    will return this directory instead of the bare ``shared/``.
+    """
+    global _current_session_dir
+    ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    session_dir = Path(work_dir) / "shared" / ts
+    session_dir.mkdir(parents=True, exist_ok=True)
+    _current_session_dir = session_dir
+    # Write initial session.json
+    (session_dir / "session.json").write_text(
+        json.dumps(
+            {"started": datetime.now().isoformat(), "models": [], "topic": ""},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return session_dir
+
+
+def set_session_dir(session_dir: str) -> None:
+    """Restore a previously created session directory (for subprocess use).
+
+    Called by chat_loop.py which runs in a separate process and cannot
+    inherit the global ``_current_session_dir`` set by run.py.
+    """
+    global _current_session_dir
+    p = Path(session_dir)
+    p.mkdir(parents=True, exist_ok=True)
+    _current_session_dir = p
+
+
+def get_shared_dir(work_dir: str) -> Path:
+    """Return the current session directory, falling back to bare shared/."""
+    if _current_session_dir is not None:
+        return _current_session_dir
+    d = Path(work_dir) / "shared"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def update_session_meta(
+    topic: str = "",
+    models: list[str] | None = None,
+) -> None:
+    """Update session.json with topic and/or model list."""
+    if _current_session_dir is None:
+        return
+    meta_file = _current_session_dir / "session.json"
+    if not meta_file.exists():
+        return
+    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    if topic and not meta.get("topic"):
+        meta["topic"] = topic
+    if models is not None:
+        meta["models"] = models
+    meta_file.write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
 
 def validate_config(
