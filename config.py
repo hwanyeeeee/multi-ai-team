@@ -5,6 +5,7 @@ import os
 import platform
 import subprocess
 from pathlib import Path
+from typing import Any, Mapping, Sequence
 
 # Detect if we are running inside WSL already
 IS_WSL = (
@@ -225,6 +226,83 @@ BATCH_SYNTHESIS_PROMPT = (
     "Include: key agreements, remaining disagreements, and actionable conclusions.\n"
     "Respond in the same language as the topic."
 )
+
+
+def validate_config(
+    ai_models: Mapping[str, Mapping[str, Any]] | None = None,
+    rounds: Sequence[Mapping[str, Any]] | None = None,
+) -> None:
+    """Validate critical runtime configuration.
+
+    Raises:
+        ValueError: If any required config value is missing or malformed.
+    """
+    cfg_models = ai_models if ai_models is not None else AI_MODELS
+    cfg_rounds = rounds if rounds is not None else ROUNDS
+
+    errors: list[str] = []
+
+    if not cfg_models:
+        errors.append("AI_MODELS must not be empty.")
+    else:
+        required_model_keys = {"binary", "args", "interactive_args", "strengths", "label"}
+        for model_name, model_cfg in cfg_models.items():
+            missing = required_model_keys - set(model_cfg.keys())
+            if missing:
+                errors.append(
+                    f"AI_MODELS['{model_name}'] missing keys: {sorted(missing)}"
+                )
+            if not isinstance(model_cfg.get("binary"), str) or not model_cfg.get("binary"):
+                errors.append(f"AI_MODELS['{model_name}']['binary'] must be a non-empty string.")
+            if not isinstance(model_cfg.get("args"), list):
+                errors.append(f"AI_MODELS['{model_name}']['args'] must be a list.")
+            if not isinstance(model_cfg.get("interactive_args"), list):
+                errors.append(f"AI_MODELS['{model_name}']['interactive_args'] must be a list.")
+            strengths = model_cfg.get("strengths")
+            if not isinstance(strengths, list) or not all(isinstance(s, str) for s in strengths):
+                errors.append(
+                    f"AI_MODELS['{model_name}']['strengths'] must be a list[str]."
+                )
+            if not isinstance(model_cfg.get("label"), str) or not model_cfg.get("label"):
+                errors.append(f"AI_MODELS['{model_name}']['label'] must be a non-empty string.")
+
+    expected_rounds = {
+        "plan": {"role", "task"},
+        "review": {"role", "task", "other_plans"},
+        "revise": {"role", "task", "my_plan", "reviews"},
+        "synthesize": {"task", "all_revised_plans"},
+    }
+
+    if not cfg_rounds:
+        errors.append("ROUNDS must not be empty.")
+    else:
+        seen_rounds: set[str] = set()
+        for idx, round_cfg in enumerate(cfg_rounds):
+            round_name = round_cfg.get("name")
+            if not isinstance(round_name, str) or not round_name:
+                errors.append(f"ROUNDS[{idx}] has invalid 'name'.")
+                continue
+
+            seen_rounds.add(round_name)
+            if not isinstance(round_cfg.get("description"), str) or not round_cfg.get("description"):
+                errors.append(f"ROUNDS[{idx}]('{round_name}') has invalid 'description'.")
+            template = round_cfg.get("prompt_template")
+            if not isinstance(template, str) or not template:
+                errors.append(f"ROUNDS[{idx}]('{round_name}') has invalid 'prompt_template'.")
+                continue
+
+            for placeholder in expected_rounds.get(round_name, set()):
+                if f"{{{placeholder}}}" not in template:
+                    errors.append(
+                        f"ROUNDS[{idx}]('{round_name}') prompt_template missing '{{{placeholder}}}'."
+                    )
+
+        missing_rounds = [name for name in expected_rounds if name not in seen_rounds]
+        if missing_rounds:
+            errors.append(f"ROUNDS missing required round(s): {missing_rounds}")
+
+    if errors:
+        raise ValueError("Invalid configuration:\n- " + "\n- ".join(errors))
 
 
 def to_wsl_path(win_path: str) -> str:

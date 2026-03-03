@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import json
-import time
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 from config import ROUNDS, AI_MODELS
 
 
@@ -17,12 +17,18 @@ class RoundManager:
         self.shared_dir = self.work_dir / "shared"
         self.shared_dir.mkdir(parents=True, exist_ok=True)
         self.chat_log = self.shared_dir / "chat.jsonl"
-        self.round_results: dict[str, dict[str, str]] = {}
+        self.round_results: dict[int, dict[str, str]] = {}
         self.active_models = active_models or list(AI_MODELS.keys())
+        self._prompt_builders: dict[str, Callable[[str, str, str], str]] = {
+            "plan": self._build_plan_prompt,
+            "review": self._build_review_prompt,
+            "revise": self._build_revise_prompt,
+            "synthesize": self._build_synthesize_prompt,
+        }
 
-    def get_round_config(self, round_index: int) -> dict:
+    def get_round_config(self, round_index: int) -> dict | None:
         """Get configuration for a specific round."""
-        if round_index >= len(ROUNDS):
+        if round_index < 0 or round_index >= len(ROUNDS):
             return None
         return ROUNDS[round_index]
 
@@ -32,49 +38,57 @@ class RoundManager:
         if not round_cfg:
             return ""
 
+        if model_name not in AI_MODELS:
+            return ""
+
         role = AI_MODELS[model_name]["label"]
         template = round_cfg["prompt_template"]
+        builder = self._prompt_builders.get(round_cfg["name"])
+        if not builder:
+            return ""
+        return builder(model_name, role, template)
 
-        if round_cfg["name"] == "plan":
-            return template.format(role=role, task=self.task)
+    def _build_plan_prompt(self, _model_name: str, role: str, template: str) -> str:
+        return template.format(role=role, task=self.task)
 
-        elif round_cfg["name"] == "review":
-            # Collect other models' plans from round 0
-            plans = self.round_results.get(0, {})
-            other_plans = ""
-            for m, text in plans.items():
-                if m != model_name:
-                    label = AI_MODELS[m]["label"]
-                    other_plans += f"--- {label} ---\n{text}\n\n"
-            return template.format(
-                role=role, task=self.task, other_plans=other_plans.strip()
-            )
+    def _build_review_prompt(self, model_name: str, role: str, template: str) -> str:
+        # Collect other models' plans from round 0
+        plans = self.round_results.get(0, {})
+        other_plans = self._join_model_sections(plans, exclude_model=model_name)
+        return template.format(role=role, task=self.task, other_plans=other_plans)
 
-        elif round_cfg["name"] == "revise":
-            my_plan = self.round_results.get(0, {}).get(model_name, "(no plan)")
-            # Collect reviews about this model from round 1
-            reviews = self.round_results.get(1, {})
-            review_text = ""
-            for m, text in reviews.items():
-                if m != model_name:
-                    label = AI_MODELS[m]["label"]
-                    review_text += f"--- Review by {label} ---\n{text}\n\n"
-            return template.format(
-                role=role,
-                task=self.task,
-                my_plan=my_plan,
-                reviews=review_text.strip(),
-            )
+    def _build_revise_prompt(self, model_name: str, role: str, template: str) -> str:
+        my_plan = self.round_results.get(0, {}).get(model_name, "(no plan)")
 
-        elif round_cfg["name"] == "synthesize":
-            revised = self.round_results.get(2, {})
-            all_plans = ""
-            for m, text in revised.items():
-                label = AI_MODELS[m]["label"]
-                all_plans += f"--- {label} (Revised Plan) ---\n{text}\n\n"
-            return template.format(task=self.task, all_revised_plans=all_plans.strip())
+        # Collect reviews from round 1 written by other models
+        reviews = self.round_results.get(1, {})
+        chunks = []
+        for reviewer, text in reviews.items():
+            if reviewer == model_name:
+                continue
+            label = AI_MODELS[reviewer]["label"]
+            chunks.append(f"--- Review by {label} ---\n{text}")
+        review_text = "\n\n".join(chunks)
+        return template.format(role=role, task=self.task, my_plan=my_plan, reviews=review_text)
 
-        return ""
+    def _build_synthesize_prompt(self, _model_name: str, _role: str, template: str) -> str:
+        revised = self.round_results.get(2, {})
+        all_plans = self._join_model_sections(revised, title_suffix=" (Revised Plan)")
+        return template.format(task=self.task, all_revised_plans=all_plans)
+
+    def _join_model_sections(
+        self,
+        items: dict[str, str],
+        exclude_model: str | None = None,
+        title_suffix: str = "",
+    ) -> str:
+        chunks = []
+        for model_name, text in items.items():
+            if model_name == exclude_model:
+                continue
+            label = AI_MODELS.get(model_name, {}).get("label", model_name)
+            chunks.append(f"--- {label}{title_suffix} ---\n{text}")
+        return "\n\n".join(chunks)
 
     def get_output_file(self, round_index: int, model_name: str) -> str:
         """Get output file path for a round/model."""

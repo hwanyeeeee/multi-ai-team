@@ -95,6 +95,32 @@ def create_team_session(session_name: str) -> dict[str, str]:
     return pane_map
 
 
+def update_pane_status(pane_target: str, role: str, status: str) -> None:
+    """Update tmux pane title with role and status.
+
+    Status should be one of: 대기중, 실행중, 완료, 에러
+    """
+    labels = {
+        "claude": "Claude (Reasoning)",
+        "codex": "Codex (Code)",
+        "gemini": "Gemini (Research)",
+        "input": "User Input",
+    }
+    label = labels.get(role, role)
+
+    # Use colors/symbols for status if desired
+    status_map = {
+        "대기중": "⏳ 대기중",
+        "실행중": "🚀 실행중",
+        "완료": "✅ 완료",
+        "에러": "❌ 에러",
+    }
+    display_status = status_map.get(status, status)
+
+    title = f"{label} [{display_status}]"
+    run_tmux(["select-pane", "-t", pane_target, "-T", title], check=False)
+
+
 def send_to_pane(pane_target: str, text: str) -> None:
     """Send text to a tmux pane (visible in the pane)."""
     run_tmux(["send-keys", "-t", pane_target, text, "Enter"])

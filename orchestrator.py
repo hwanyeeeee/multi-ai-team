@@ -26,6 +26,7 @@ from ai_worker import (
     send_message_to_pane,
     wait_for_all_panes_idle,
 )
+from conversation import SharedContext
 
 
 class TaskOrchestrator:
@@ -40,6 +41,7 @@ class TaskOrchestrator:
         self.pane_map = pane_map
         self.work_dir = work_dir
         self.active_models = active_models
+        self.shared_ctx = SharedContext(work_dir)
 
     def run(self, task: str) -> str:
         """Full orchestration pipeline: plan -> assign -> execute."""
@@ -69,7 +71,7 @@ class TaskOrchestrator:
                 strengths=", ".join(cfg["strengths"]),
                 task=task,
             )
-            out_file = str(Path(self.work_dir) / "shared" / f"orch_plan_{model}.txt")
+            out_file = str(Path(self.work_dir) / "shared" / f"orch_plan_{model}.md")
             result = run_ai_cli(model, prompt, self.work_dir, out_file)
             return model, result
 
@@ -79,9 +81,11 @@ class TaskOrchestrator:
             for future in concurrent.futures.as_completed(futures):
                 model, result = future.result()
                 label = AI_MODELS[model]["label"]
-                status = "Done" if not result.startswith("[") else result[:40]
+                is_err = getattr(result, "is_error", False)
+                status = "Done" if not is_err else result[:40]
                 print(f"    {label}: {status}")
                 plans[model] = result
+                self.shared_ctx.add_response(model, result, round_name="plan")
 
         return plans
 
@@ -103,7 +107,7 @@ class TaskOrchestrator:
             model_strengths=self._format_strengths(),
             active_models=", ".join(self.active_models),
         )
-        out_file = str(Path(self.work_dir) / "shared" / "orch_assign.txt")
+        out_file = str(Path(self.work_dir) / "shared" / "orch_assign.md")
         raw = run_ai_cli("claude", prompt, self.work_dir, out_file)
 
         assignments = self._parse_assignments(raw)
@@ -170,7 +174,7 @@ class TaskOrchestrator:
             assignments=assign_text,
             all_results=all_results,
         )
-        out_file = str(Path(self.work_dir) / "shared" / "orch_final.txt")
+        out_file = str(Path(self.work_dir) / "shared" / "orch_final.md")
         return run_ai_cli("claude", prompt, self.work_dir, out_file)
 
     # -- Helpers ------------------------------------------------------------
@@ -217,6 +221,7 @@ class BatchDiscussion:
         self.work_dir = work_dir
         self.active_models = active_models
         self.history: list[dict[str, str]] = []  # [{model: response}, ...]
+        self.shared_ctx = SharedContext(work_dir)
 
     def run(self, topic: str) -> str:
         """Run discussion until convergence or max rounds."""
@@ -263,7 +268,7 @@ class BatchDiscussion:
             out_file = str(
                 Path(self.work_dir)
                 / "shared"
-                / f"batch_r{round_num}_{model}.txt"
+                / f"batch_r{round_num}_{model}.md"
             )
             result = run_ai_cli(model, prompt, self.work_dir, out_file)
             return model, result
@@ -274,10 +279,20 @@ class BatchDiscussion:
             for future in concurrent.futures.as_completed(futures):
                 model, result = future.result()
                 label = AI_MODELS[model]["label"]
-                word_count = len(result.split())
-                status = f"Done ({word_count} words)" if not result.startswith("[") else result[:40]
-                print(f"    {label}: {status}")
+                is_err = getattr(result, "is_error", False)
+                if not is_err:
+                    word_count = len(result.split())
+                    print(f"    {label}: Done ({word_count} words)")
+                    print(f"    ┌─ {label} ─")
+                    for line in str(result).splitlines():
+                        print(f"    │ {line}")
+                    print(f"    └{'─' * 40}")
+                else:
+                    print(f"    {label}: {result[:40]}")
                 responses[model] = result
+                self.shared_ctx.add_response(
+                    model, result, round_name=f"batch_r{round_num}",
+                )
 
         return responses
 
@@ -288,7 +303,7 @@ class BatchDiscussion:
             history=self._format_history(),
         )
         out_file = str(
-            Path(self.work_dir) / "shared" / "batch_consensus.txt"
+            Path(self.work_dir) / "shared" / "batch_consensus.md"
         )
         result = run_ai_cli("claude", prompt, self.work_dir, out_file)
 
@@ -309,7 +324,7 @@ class BatchDiscussion:
             history=self._format_history(),
         )
         out_file = str(
-            Path(self.work_dir) / "shared" / "batch_synthesis.txt"
+            Path(self.work_dir) / "shared" / "batch_synthesis.md"
         )
         return run_ai_cli("claude", prompt, self.work_dir, out_file)
 

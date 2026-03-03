@@ -12,6 +12,12 @@ import re
 import sys
 from pathlib import Path
 
+from rich.console import Console
+from rich.panel import Panel
+from rich.text import Text
+from rich.live import Live
+from rich.table import Table
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import AI_MODELS, CHAT_SYNTHESIS_ENABLED
@@ -21,9 +27,11 @@ from ai_worker import (
     wait_for_all_panes_idle,
     synthesize_responses,
 )
+from tmux_manager import update_pane_status
 from conversation import ConversationLog
 from orchestrator import TaskOrchestrator, BatchDiscussion
 
+console = Console()
 
 def parse_mentions(
     message: str, active_models: list[str]
@@ -50,11 +58,7 @@ def parse_mentions(
 
 def _print_synthesis(summary: str) -> None:
     """Print formatted synthesis result."""
-    print(f"\n{'='*50}")
-    print("  [Synthesis]")
-    print(f"{'='*50}")
-    print(summary)
-    print(f"{'='*50}")
+    console.print(Panel(summary, title="[bold magenta]AI Synthesis[/bold magenta]", border_style="magenta"))
 
 
 def handle_command(
@@ -68,29 +72,33 @@ def handle_command(
     lower = cmd.lower().strip()
 
     if lower in ("/quit", "/exit"):
-        print("Goodbye!")
+        console.print("[bold yellow]Goodbye![/bold yellow]")
         return True
 
     if lower == "/history":
-        print(log.display())
+        console.print(Panel(log.display(), title="Conversation History"))
         return False
 
     if lower == "/clear":
         log.clear()
-        print("Log cleared.")
+        console.print("[bold green]Log cleared.[/bold green]")
         return False
 
     if lower == "/models":
-        print("Active models:")
+        table = Table(title="Active Models")
+        table.add_column("Mention", style="cyan")
+        table.add_column("Label", style="green")
+        table.add_column("Strengths", style="yellow")
         for m in active_models:
             cfg = AI_MODELS.get(m, {})
             label = cfg.get("label", m)
             strengths = ", ".join(cfg.get("strengths", []))
-            print(f"  @{m} - {label} ({strengths})")
+            table.add_row(f"@{m}", label, strengths)
+        console.print(table)
         return False
 
     if lower == "/synth":
-        print("Capturing responses from all panes...")
+        console.print("[bold blue]Capturing responses from all panes...[/bold blue]")
         responses = {}
         for model in active_models:
             pane = pane_map.get(model)
@@ -98,38 +106,41 @@ def handle_command(
                 content = capture_pane_content(pane, lines=80)
                 responses[model] = content
                 label = AI_MODELS.get(model, {}).get("label", model)
-                print(f"\n--- {label} (last ~80 lines) ---")
+                console.print(f"\n[bold]--- {label} (last ~80 lines) ---[/bold]")
                 recent = content.strip().splitlines()[-10:]
                 for line in recent:
-                    print(f"  {line}")
+                    console.print(f"  {line}")
         # Run synthesis if Claude is available
         if responses and "claude" in active_models and work_dir:
-            print("\n  Synthesizing with Claude...")
+            console.print("\n[bold magenta]Synthesizing with Claude...[/bold magenta]")
             summary = synthesize_responses(responses, "(manual /synth)", work_dir)
             _print_synthesis(summary)
-        print()
         return False
 
     if lower.startswith("/task ") or lower == "/task":
         task_desc = cmd[5:].strip()
         if not task_desc:
-            print("Usage: /task <description>")
+            console.print("[bold red]Usage: /task <description>[/bold red]")
             return False
         if not work_dir:
-            print("Error: work_dir not set. Cannot run /task.")
+            console.print("[bold red]Error: work_dir not set. Cannot run /task.[/bold red]")
             return False
         orch = TaskOrchestrator(pane_map, work_dir, active_models)
         result = orch.run(task_desc)
         _print_synthesis(result)
+        # Reset statuses
+        for m in active_models:
+            if m in pane_map:
+                update_pane_status(pane_map[m], m, "대기중")
         return False
 
     if lower.startswith("/batch ") or lower == "/batch":
         topic = cmd[6:].strip()
         if not topic:
-            print("Usage: /batch <topic>")
+            console.print("[bold red]Usage: /batch <topic>[/bold red]")
             return False
         if not work_dir:
-            print("Error: work_dir not set. Cannot run /batch.")
+            console.print("[bold red]Error: work_dir not set. Cannot run /batch.[/bold red]")
             return False
         disc = BatchDiscussion(work_dir, active_models)
         result = disc.run(topic)
@@ -137,24 +148,27 @@ def handle_command(
         return False
 
     if lower == "/help":
-        print("Commands:")
-        print("  /quit or /exit  - Exit chat")
-        print("  /history        - Show message log")
-        print("  /clear          - Clear log")
-        print("  /models         - Show available AI models")
-        print("  /synth          - Capture AI responses & synthesize")
-        print("  /autosynth      - Toggle auto-synthesis on/off")
-        print("  /task <desc>    - Auto-orchestrate: plan, assign, execute")
-        print("  /batch <topic>  - AI-to-AI discussion until consensus")
-        print("  /help           - Show this help")
-        print()
-        print("Use @model to target specific AIs:")
-        print("  @codex analyze this code")
-        print("  @claude @gemini review this approach")
-        print("  (no mention = all AIs respond, auto-synthesis runs)")
+        help_text = (
+            "[bold cyan]Commands:[/bold cyan]\n"
+            "  /quit or /exit  - Exit chat\n"
+            "  /history        - Show message log\n"
+            "  /clear          - Clear log\n"
+            "  /models         - Show available AI models\n"
+            "  /synth          - Capture AI responses & synthesize\n"
+            "  /autosynth      - Toggle auto-synthesis on/off\n"
+            "  /task <desc>    - Auto-orchestrate: plan, assign, execute\n"
+            "  /batch <topic>  - AI-to-AI discussion until consensus\n"
+            '  \"\"\"             - Multi-line input mode (\"\"\" to submit)\n'
+            "  /help           - Show this help\n\n"
+            "[bold cyan]Use @model to target specific AIs:[/bold cyan]\n"
+            "  @codex analyze this code\n"
+            "  @claude @gemini review this approach\n"
+            "  (no mention = all AIs respond, auto-synthesis runs)"
+        )
+        console.print(Panel(help_text, title="Help"))
         return False
 
-    print(f"Unknown command: {cmd}. Type /help for available commands.")
+    console.print(f"[bold red]Unknown command: {cmd}. Type /help for available commands.[/bold red]")
     return False
 
 
@@ -172,35 +186,57 @@ def run_chat_loop(
     log = ConversationLog(work_dir)
     auto_synth = CHAT_SYNTHESIS_ENABLED and ("claude" in active_models)
 
-    print("=" * 50)
-    print("  Multi-AI Team Chat")
-    print("=" * 50)
-    print(f"  Models: {', '.join(active_models)}")
-    print("  AI CLIs are running in interactive mode.")
-    print("  Each AI maintains its own conversation history.")
-    synth_status = "ON" if auto_synth else "OFF"
-    print(f"  Auto-synthesis: {synth_status} (/autosynth to toggle)")
-    print("  Type /help for commands")
-    print("=" * 50)
-    print()
+    # Set initial status to 대기중
+    for m in active_models:
+        if m in pane_map:
+            update_pane_status(pane_map[m], m, "대기중")
+
+    welcome_text = Text.assemble(
+        ("Multi-AI Team Chat\n", "bold cyan"),
+        (f"Models: {', '.join(active_models)}\n", "green"),
+        ("AI CLIs are running in interactive mode.\n", "white"),
+        ("Auto-synthesis: ", "white"),
+        ("ON" if auto_synth else "OFF", "bold green" if auto_synth else "bold red"),
+        (" (/autosynth to toggle)\n", "white"),
+        ("Type /help for commands", "italic white")
+    )
+    console.print(Panel(welcome_text, border_style="cyan"))
 
     while True:
         try:
-            user_input = input("You > ").strip()
+            # Custom prompt for user input
+            console.print("[bold blue]You > [/bold blue]", end="")
+            user_input = sys.stdin.readline().strip()
         except (EOFError, KeyboardInterrupt):
-            print("\nGoodbye!")
+            console.print("\n[bold yellow]Goodbye![/bold yellow]")
             break
 
         if not user_input:
             continue
+
+        # Multi-line input mode: start with """ and end with """
+        if user_input == '"""':
+            console.print("[dim]  (Multi-line mode: type \"\"\" to submit)[/dim]")
+            lines = []
+            while True:
+                try:
+                    line = sys.stdin.readline()
+                    if line.strip() == '"""':
+                        break
+                    lines.append(line.rstrip("\n"))
+                except (EOFError, KeyboardInterrupt):
+                    break
+            user_input = "\n".join(lines).strip()
+            if not user_input:
+                continue
 
         # Handle /commands
         if user_input.startswith("/"):
             if user_input.lower().strip() == "/autosynth":
                 auto_synth = not auto_synth
                 state = "ON" if auto_synth else "OFF"
-                print(f"  Auto-synthesis: {state}")
-                print()
+                style = "bold green" if auto_synth else "bold red"
+                console.print(f"  Auto-synthesis: [{style}]{state}[/{style}]")
                 continue
             if handle_command(user_input, log, active_models, pane_map, work_dir):
                 break
@@ -209,7 +245,7 @@ def run_chat_loop(
         # Parse @mentions
         clean_msg, targets = parse_mentions(user_input, active_models)
         if not clean_msg:
-            print("(Empty message after removing mentions)")
+            console.print("[italic red](Empty message after removing mentions)[/italic red]")
             continue
 
         target_models = targets if targets else active_models
@@ -220,26 +256,32 @@ def run_chat_loop(
         for model_name in target_models:
             pane = pane_map.get(model_name)
             if pane:
+                update_pane_status(pane, model_name, "실행중")
                 send_message_to_pane(pane, clean_msg)
                 sent.append(model_name)
 
         if targets:
             labels = [AI_MODELS[m]["label"] for m in sent]
-            print(f"  -> Sent to: {', '.join(labels)}")
+            console.print(f"  [bold green]-> Sent to:[/bold green] {', '.join(labels)}")
         else:
-            print(f"  -> Sent to all {len(sent)} AIs")
+            console.print(f"  [bold green]-> Sent to all {len(sent)} AIs[/bold green]")
 
         # Auto-synthesis when 2+ AIs respond
         if auto_synth and len(sent) >= 2 and work_dir:
-            print("  Waiting for AI responses...")
+            console.print("  [italic]Waiting for AI responses...[/italic]")
             pane_targets = {m: pane_map[m] for m in sent if m in pane_map}
             responses = wait_for_all_panes_idle(pane_targets)
-            print("  Synthesizing with Claude...")
+            console.print("  [bold magenta]Synthesizing with Claude...[/bold magenta]")
             summary = synthesize_responses(responses, clean_msg, work_dir)
             _print_synthesis(summary)
+            # Reset statuses to 완료 is handled by wait_for_all_panes_idle
+            # But let's make sure they are set to 대기중 eventually or just leave as 완료
+            for m in sent:
+                if m in pane_map:
+                    update_pane_status(pane_map[m], m, "대기중")
         else:
-            print("  (Watch their panes for responses)")
-        print()
+            console.print("  [italic](Watch their panes for responses)[/italic]")
+        console.print()
 
 
 def main():

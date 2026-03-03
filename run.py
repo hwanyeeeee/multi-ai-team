@@ -24,7 +24,15 @@ from pathlib import Path
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
-from config import AI_MODELS, ROUNDS, TMUX_SESSION_PREFIX, AI_RESPONSE_TIMEOUT_SEC, detect_available_models, wsl_prefix
+from config import (
+    AI_MODELS,
+    ROUNDS,
+    TMUX_SESSION_PREFIX,
+    AI_RESPONSE_TIMEOUT_SEC,
+    detect_available_models,
+    validate_config,
+    wsl_prefix,
+)
 from round_manager import RoundManager
 from ai_worker import run_ai_cli
 
@@ -156,6 +164,12 @@ def run_tmux_chat(work_dir: str) -> None:
 
 def _init_and_check(skip_check: bool, no_tmux: bool) -> None:
     """Run prerequisite checks. Exits on fatal issues."""
+    try:
+        validate_config()
+    except ValueError as e:
+        print(f"\nERROR: Invalid configuration.\n{e}")
+        sys.exit(1)
+
     if skip_check:
         return
     issues = check_prerequisites()
