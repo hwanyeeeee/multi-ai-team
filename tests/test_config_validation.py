@@ -15,7 +15,6 @@ def test_validate_config_rejects_missing_model_keys() -> None:
             "binary": "codex",
             "args": [],
             "interactive_args": [],
-            "strengths": ["code"],
             # label intentionally missing
         }
     }
@@ -30,5 +29,5 @@ def test_validate_config_rejects_missing_round_placeholders() -> None:
         "description": "broken",
         "prompt_template": "Task only: {task}",
     }
-    with pytest.raises(ValueError, match="missing '\\{role\\}'"):
+    with pytest.raises(ValueError, match="missing '\\{name\\}'"):
         validate_config(ai_models=AI_MODELS, rounds=broken_rounds)

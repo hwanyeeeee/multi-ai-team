@@ -34,24 +34,21 @@ AI_MODELS = {
         "wsl_path": None,  # Resolved at runtime by detect_available_models()
         "args": ["--print", "--dangerously-skip-permissions"],  # batch mode (one-shot)
         "interactive_args": ["--dangerously-skip-permissions"],
-        "strengths": ["complex reasoning", "architecture", "code review", "planning"],
-        "label": "Claude (Reasoning/Architecture)",
+        "label": "Claude",
     },
     "codex": {
         "binary": "codex",
         "wsl_path": None,
         "args": ["exec", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox"],  # batch mode
         "interactive_args": ["--dangerously-bypass-approvals-and-sandbox"],
-        "strengths": ["code generation", "fast iteration", "debugging", "testing"],
-        "label": "Codex (Code/Analysis)",
+        "label": "Codex",
     },
     "gemini": {
         "binary": "gemini",
         "wsl_path": None,
         "args": ["--yolo", "-p"],  # batch mode — -p must be last (takes prompt as next arg)
         "interactive_args": ["--yolo"],
-        "strengths": ["research", "long context", "frontend", "documentation"],
-        "label": "Gemini (Research/Frontend)",
+        "label": "Gemini",
     },
 }
 
@@ -92,9 +89,9 @@ ROUNDS = [
         "name": "plan",
         "description": "각자 계획안 작성",
         "prompt_template": (
-            "You are part of a multi-AI team. Your role: {role}.\n"
+            "You are {name}, part of a multi-AI team.\n"
             "Task: {task}\n\n"
-            "Write your implementation plan. Be specific about:\n"
+            "Write your plan. Be specific about:\n"
             "1. Your approach\n"
             "2. Key decisions and why\n"
             "3. Potential risks\n"
@@ -105,7 +102,7 @@ ROUNDS = [
         "name": "review",
         "description": "다른 AI들의 계획을 리뷰",
         "prompt_template": (
-            "You are part of a multi-AI team. Your role: {role}.\n"
+            "You are {name}, part of a multi-AI team.\n"
             "Task: {task}\n\n"
             "Review these plans from your teammates:\n\n"
             "{other_plans}\n\n"
@@ -121,7 +118,7 @@ ROUNDS = [
         "name": "revise",
         "description": "리뷰 반영하여 최종안 수정",
         "prompt_template": (
-            "You are part of a multi-AI team. Your role: {role}.\n"
+            "You are {name}, part of a multi-AI team.\n"
             "Task: {task}\n\n"
             "Your original plan:\n{my_plan}\n\n"
             "Reviews from teammates:\n{reviews}\n\n"
@@ -137,33 +134,15 @@ ROUNDS = [
             "Task: {task}\n\n"
             "Final revised plans from all team members:\n\n"
             "{all_revised_plans}\n\n"
-            "Synthesize these into ONE final, unified implementation plan that:\n"
+            "Synthesize these into ONE final, unified plan that:\n"
             "1. Takes the best ideas from each\n"
             "2. Resolves any conflicts\n"
-            "3. Assigns roles based on each AI's strengths\n"
+            "3. Assigns clear responsibilities\n"
             "4. Provides a clear execution order\n\n"
             "Output the final plan."
         ),
     },
 ]
-
-# Keyword-to-model routing for smart message dispatch
-SMART_ROUTING_KEYWORDS: dict[str, list[str]] = {
-    "claude": [
-        "설계", "아키텍처", "architecture", "design", "plan", "계획",
-        "리뷰", "review", "분석", "analyze", "reason", "추론", "왜",
-    ],
-    "codex": [
-        "코드", "code", "구현", "implement", "작성", "write", "함수",
-        "function", "버그", "bug", "fix", "수정", "디버그", "debug",
-        "테스트", "test", "리팩토링", "refactor",
-    ],
-    "gemini": [
-        "검색", "search", "research", "조사", "문서", "doc", "documentation",
-        "프론트", "frontend", "UI", "css", "html", "react", "컴포넌트",
-    ],
-}
-DEFAULT_ROUTE_MODEL = "claude"  # fallback when no keyword matches
 
 # Context management thresholds (characters)
 # Approximate: 1 token ≈ 4 chars for English, ≈ 2 chars for Korean
@@ -172,7 +151,7 @@ CONTEXT_RESET_CHARS = 150000       # ~37K tokens, auto-reset
 CONTEXT_CHECK_INTERVAL = 5         # check every N messages
 
 CONTEXT_RESET_SUMMARY_PROMPT = (
-    "Below is a conversation history from {label}. "
+    "Below is a conversation history from {name}. "
     "Summarize the key context, decisions, and current task state in under 200 words. "
     "This summary will be used to restore context after a session reset. "
     "Focus on: what task is being worked on, what was decided, what remains to do.\n\n"
@@ -191,11 +170,9 @@ CHAT_SYNTHESIS_ENABLED = True
 
 # Orchestration prompt templates (/task auto-delegation)
 ORCH_PLAN_PROMPT = (
-    "You are {label}, part of a multi-AI team.\n"
-    "Your strengths: {strengths}\n\n"
+    "You are {name}, part of a multi-AI team.\n\n"
     "Task: {task}\n\n"
     "Write a brief plan for how YOU would contribute to this task.\n"
-    "Focus on the parts you're best suited for.\n"
     "Be specific and actionable. Keep it under 200 words.\n"
     "Respond in the same language as the task."
 )
@@ -204,24 +181,13 @@ ORCH_ASSIGN_PROMPT = (
     "You are the task coordinator for a multi-AI team.\n"
     "Task: {task}\n\n"
     "Plans from each AI:\n{all_plans}\n\n"
-    "AI Strengths:\n{model_strengths}\n\n"
-    "Based on these plans and strengths, assign a specific task to each AI.\n"
+    "Based on these plans, assign a specific task to each AI.\n"
     "Output in this exact format (one line per AI, parseable):\n"
     "[claude] Specific instruction for Claude\n"
     "[codex] Specific instruction for Codex\n"
     "[gemini] Specific instruction for Gemini\n\n"
     "Each instruction should be a clear, actionable directive.\n"
     "Only assign tasks to available AIs: {active_models}\n"
-    "IMPORTANT: Follow existing code conventions — match the project's naming style, "
-    "formatting, and patterns. Do not introduce new styles.\n"
-    "Respond in the same language as the task."
-)
-
-ORCH_DISCOVER_PROMPT = (
-    "You are {label}. Before implementing, explore the codebase first.\n"
-    "Your assigned task: {instruction}\n\n"
-    "List the files, functions, and dependencies you need to understand.\n"
-    "Identify potential risks or blockers. Keep it under 150 words.\n"
     "Respond in the same language as the task."
 )
 
@@ -237,8 +203,7 @@ ORCH_FINAL_PROMPT = (
 
 # Batch discussion prompts (/batch AI-to-AI debate)
 BATCH_OPEN_PROMPT = (
-    "You are {label}, part of a multi-AI team discussion.\n"
-    "Your strengths: {strengths}\n\n"
+    "You are {name}, part of a multi-AI team discussion.\n\n"
     "Topic: {topic}\n\n"
     "Share your perspective on this topic.\n"
     "Be specific and opinionated. Keep it under 200 words.\n"
@@ -246,8 +211,7 @@ BATCH_OPEN_PROMPT = (
 )
 
 BATCH_REPLY_PROMPT = (
-    "You are {label}, part of a multi-AI team discussion.\n"
-    "Your strengths: {strengths}\n\n"
+    "You are {name}, part of a multi-AI team discussion.\n\n"
     "Topic: {topic}\n\n"
     "Previous discussion:\n{history}\n\n"
     "Before responding, analyze the other AIs' arguments:\n"
@@ -263,15 +227,13 @@ BATCH_REPLY_PROMPT = (
 # IMPORTANT: Must be a single line — tmux send-keys treats \n as Enter,
 # which would submit partial messages in TUI-based CLIs.
 INTERACTIVE_TEAM_CONTEXT = (
-    "[Team Context] You are {label}, part of a multi-AI collaboration team. "
-    "Your strengths: {strengths}. "
-    "Teammates: {teammates}. "
+    "[Team Context] You are {name}, part of a 3-AI collaboration team ({teammates}). "
     "A human operator sends messages from the chat pane and may address you with @{name}. "
     "Other AIs cannot see your responses directly — the operator relays context or uses /synth. "
-    "Focus on YOUR strengths; if a task suits a teammate better, say so. "
-    "IMPORTANT: Follow existing code conventions — match naming style, formatting, and patterns already in the project. "
+    "IMPORTANT: Do NOT take any action on your own. Wait for the operator to give you a task. "
+    "Do NOT read, explore, or modify any files until explicitly asked. "
     "Be concise and actionable. Respond in the same language as the operator. "
-    "Acknowledge briefly that you are ready."
+    "Acknowledge briefly that you are ready, then WAIT."
 )
 
 BATCH_CONSENSUS_PROMPT = (
@@ -377,7 +339,7 @@ def validate_config(
     if not cfg_models:
         errors.append("AI_MODELS must not be empty.")
     else:
-        required_model_keys = {"binary", "args", "interactive_args", "strengths", "label"}
+        required_model_keys = {"binary", "args", "interactive_args", "label"}
         for model_name, model_cfg in cfg_models.items():
             missing = required_model_keys - set(model_cfg.keys())
             if missing:
@@ -390,18 +352,13 @@ def validate_config(
                 errors.append(f"AI_MODELS['{model_name}']['args'] must be a list.")
             if not isinstance(model_cfg.get("interactive_args"), list):
                 errors.append(f"AI_MODELS['{model_name}']['interactive_args'] must be a list.")
-            strengths = model_cfg.get("strengths")
-            if not isinstance(strengths, list) or not all(isinstance(s, str) for s in strengths):
-                errors.append(
-                    f"AI_MODELS['{model_name}']['strengths'] must be a list[str]."
-                )
             if not isinstance(model_cfg.get("label"), str) or not model_cfg.get("label"):
                 errors.append(f"AI_MODELS['{model_name}']['label'] must be a non-empty string.")
 
     expected_rounds = {
-        "plan": {"role", "task"},
-        "review": {"role", "task", "other_plans"},
-        "revise": {"role", "task", "my_plan", "reviews"},
+        "plan": {"name", "task"},
+        "review": {"name", "task", "other_plans"},
+        "revise": {"name", "task", "my_plan", "reviews"},
         "synthesize": {"task", "all_revised_plans"},
     }
 

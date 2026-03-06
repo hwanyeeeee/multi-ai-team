@@ -40,23 +40,22 @@ class RoundManager:
         if model_name not in AI_MODELS:
             return ""
 
-        role = AI_MODELS[model_name]["label"]
         template = round_cfg["prompt_template"]
         builder = self._prompt_builders.get(round_cfg["name"])
         if not builder:
             return ""
-        return builder(model_name, role, template)
+        return builder(model_name, model_name, template)
 
-    def _build_plan_prompt(self, _model_name: str, role: str, template: str) -> str:
-        return template.format(role=role, task=self.task)
+    def _build_plan_prompt(self, _model_name: str, name: str, template: str) -> str:
+        return template.format(name=name, task=self.task)
 
-    def _build_review_prompt(self, model_name: str, role: str, template: str) -> str:
+    def _build_review_prompt(self, model_name: str, name: str, template: str) -> str:
         # Collect other models' plans from round 0
         plans = self.round_results.get(0, {})
         other_plans = self._join_model_sections(plans, exclude_model=model_name)
-        return template.format(role=role, task=self.task, other_plans=other_plans)
+        return template.format(name=name, task=self.task, other_plans=other_plans)
 
-    def _build_revise_prompt(self, model_name: str, role: str, template: str) -> str:
+    def _build_revise_prompt(self, model_name: str, name: str, template: str) -> str:
         my_plan = self.round_results.get(0, {}).get(model_name, "(no plan)")
 
         # Collect reviews from round 1 written by other models
@@ -65,10 +64,10 @@ class RoundManager:
         for reviewer, text in reviews.items():
             if reviewer == model_name:
                 continue
-            label = AI_MODELS[reviewer]["label"]
-            chunks.append(f"--- Review by {label} ---\n{text}")
+            reviewer_name = AI_MODELS[reviewer]["label"]
+            chunks.append(f"--- Review by {reviewer_name} ---\n{text}")
         review_text = "\n\n".join(chunks)
-        return template.format(role=role, task=self.task, my_plan=my_plan, reviews=review_text)
+        return template.format(name=name, task=self.task, my_plan=my_plan, reviews=review_text)
 
     def _build_synthesize_prompt(self, _model_name: str, _role: str, template: str) -> str:
         revised = self.round_results.get(2, {})

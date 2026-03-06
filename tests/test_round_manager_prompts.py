@@ -8,7 +8,7 @@ def test_build_prompt_plan_round(tmp_path) -> None:
     prompt = rm.build_prompt(0, "claude")
 
     assert "Task: Implement API" in prompt
-    assert "Claude (Reasoning/Architecture)" in prompt
+    assert "You are claude" in prompt
 
 
 def test_build_prompt_review_round_excludes_self_plan(tmp_path) -> None:

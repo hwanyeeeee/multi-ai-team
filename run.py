@@ -157,18 +157,9 @@ def run_tmux_chat(work_dir: str) -> None:
         if pane and role in active:
             model_cfg = AI_MODELS[role]
             # Build teammate list (everyone except this AI)
-            teammates = []
-            for other in active:
-                if other == role:
-                    continue
-                other_cfg = AI_MODELS[other]
-                teammates.append(
-                    f"{other_cfg['label']} ({', '.join(other_cfg['strengths'])})"
-                )
+            teammates = [other for other in active if other != role]
             context_msg = INTERACTIVE_TEAM_CONTEXT.format(
-                label=model_cfg["label"],
-                strengths=", ".join(model_cfg["strengths"]),
-                teammates=" / ".join(teammates) if teammates else "(solo mode)",
+                teammates=", ".join(teammates) if teammates else "(solo mode)",
                 name=role,
             )
             start_interactive(pane, role, initial_prompt=context_msg)

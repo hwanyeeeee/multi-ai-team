@@ -16,13 +16,14 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 2  # Maximum additional attempts after first failure
 
 # TUI input timing (for send_message_to_pane)
-HEX_CHUNK_BYTES = 200            # bytes per hex-mode tmux call
-HEX_CHUNK_DELAY_SEC = 0.2        # pause between hex chunks
+HEX_CHUNK_BYTES = 100            # bytes per hex-mode tmux call (smaller = more reliable)
+HEX_CHUNK_DELAY_SEC = 0.3        # pause between hex chunks (longer = less tmux contention)
 POST_TEXT_SETTLE_SEC = 2.0       # wait for TUI to finish rendering before Enter
 ENTER_BASE_DELAY_SEC = 1.0       # initial wait before first Enter
 ENTER_RETRY_BACKOFF_SEC = 1.0    # added per retry attempt
 ENTER_VERIFY_WAIT_SEC = 1.0      # wait after Enter before checking pane
 MAX_ENTER_RETRIES = 3            # max Enter attempts
+MAX_TUI_MSG_CHARS = 0            # no limit — hex+xargs handles any length
 
 
 class AIResult(str):
@@ -362,50 +363,154 @@ def restart_interactive(pane_target: str, model_name: str, initial_prompt: str =
 def send_message_to_pane(pane_target: str, message: str) -> None:
     """Send a chat message to an AI running in interactive mode.
 
-    Uses ``tmux send-keys -H`` (hex mode) to send raw bytes directly,
-    completely bypassing bracket-paste mode.  ``send-keys -l`` wraps
-    input in bracket-paste escape sequences which TUI apps (ink/React)
-    may handle incorrectly — swallowing Enter or truncating long text.
-
-    Hex mode sends each byte as-is, so Enter (0x0D) at the end is
-    always delivered as a normal keystroke.
+    Uses ``tmux send-keys -H`` (hex mode) to bypass bracket-paste for
+    the text, then sends a named ``Enter`` key separately.  Hex ``0d``
+    does NOT work as Enter in TUI apps (ink/React), so the named key
+    is required.
     """
-    # Flatten to single line
     clean = message.replace("\n", " ").replace("\r", " ")
 
-    # Convert entire message to hex bytes
-    hex_bytes = [f"{b:02x}" for b in clean.encode("utf-8")]
+    # Send text via hex (no Enter) — no length limit, hex+xargs handles any size
+    _send_hex_text_fast(pane_target, clean)
 
-    # Send text in hex chunks (bypasses bracket paste entirely)
-    for i in range(0, len(hex_bytes), HEX_CHUNK_BYTES):
-        chunk = hex_bytes[i:i + HEX_CHUNK_BYTES]
-        subprocess.run(
-            wsl_prefix() + ["tmux", "send-keys", "-t", pane_target, "-H"] + chunk,
-            capture_output=True, timeout=10,
-        )
-        if i + HEX_CHUNK_BYTES < len(hex_bytes):
-            time.sleep(HEX_CHUNK_DELAY_SEC)
-
-    # Let TUI fully render the typed input before taking baseline snapshot
+    # Let TUI render the text before sending Enter
     time.sleep(POST_TEXT_SETTLE_SEC)
-    before = capture_pane_content(pane_target, lines=5)
 
-    # Send Enter (0x0D) with retry — also in hex mode to stay consistent
+    # Send named Enter key (works reliably for all TUI CLIs)
+    subprocess.run(
+        wsl_prefix() + ["tmux", "send-keys", "-t", pane_target, "Enter"],
+        capture_output=True, timeout=5,
+    )
+
+
+def _send_hex_text_fast(pane_target: str, text: str) -> None:
+    """Send text as hex bytes to a pane via temp file + xargs (no Enter).
+
+    Writes hex string to a temp file via stdin (avoids Windows 32KB
+    command-line limit for long messages), then pipes it through
+    ``xargs tmux send-keys -H`` for a single fast delivery.
+
+    Note: hex ``0d`` (CR) does NOT work as Enter in TUI apps
+    (ink/React).  Use ``tmux send-keys Enter`` separately.
+    """
+    raw = text.encode("utf-8")
+    hex_str = " ".join(f"{b:02x}" for b in raw)
+
+    # Write hex to temp file via stdin (not command-line args)
+    tmp_file = "/tmp/_team_hex_single.txt"
+    subprocess.run(
+        wsl_prefix() + ["bash", "-c", f"cat > {tmp_file}"],
+        input=hex_str.encode("ascii"),
+        capture_output=True, timeout=10,
+    )
+    # Send via xargs (reads from file, handles arg-length splitting)
+    subprocess.run(
+        wsl_prefix() + ["bash", "-c",
+                        f"cat {tmp_file} | xargs tmux send-keys -t {pane_target} -H"],
+        capture_output=True, timeout=30,
+    )
+
+
+def _send_enter_with_retry(pane_target: str) -> None:
+    """Send Enter to a pane with retry logic.
+
+    Uses normalized comparison to avoid false retries caused by
+    TUI noise (spinners, ANSI codes, cursor movement).
+    Alternates between hex Enter (0x0d) and tmux 'Enter' key
+    for maximum compatibility across different CLI TUIs.
+
+    First checks if Enter was already accepted (e.g. from a prior
+    parallel send), and skips if content already changed.
+    """
+    # Use more lines (20) to detect changes — some TUIs have static footer areas
+    before = _normalize_for_compare(capture_pane_content(pane_target, lines=20))
+
     for attempt in range(MAX_ENTER_RETRIES):
-        delay = ENTER_BASE_DELAY_SEC + attempt * ENTER_RETRY_BACKOFF_SEC
-        time.sleep(delay)
+        # Check if content already changed (Enter was accepted by prior send)
+        current = _normalize_for_compare(capture_pane_content(pane_target, lines=20))
+        if current != before:
+            return  # Already accepted
+
+        if attempt > 0:
+            time.sleep(ENTER_RETRY_BACKOFF_SEC)
+
+        if attempt % 2 == 0:
+            # tmux named key Enter (works for Gemini / standard TUI)
+            subprocess.run(
+                wsl_prefix() + ["tmux", "send-keys", "-t", pane_target, "Enter"],
+                capture_output=True, timeout=5,
+            )
+        else:
+            # Hex mode Enter (works for Claude Code / ink TUI)
+            subprocess.run(
+                wsl_prefix() + ["tmux", "send-keys", "-t", pane_target, "-H", "0d"],
+                capture_output=True, timeout=5,
+            )
+
+        time.sleep(ENTER_VERIFY_WAIT_SEC)
+        after = _normalize_for_compare(capture_pane_content(pane_target, lines=20))
+        if after != before:
+            return
+        logger.warning(
+            "_send_enter_with_retry: attempt %d/%d — pane %s unchanged",
+            attempt + 1, MAX_ENTER_RETRIES, pane_target,
+        )
+
+
+def send_message_to_panes_parallel(pane_messages: list[tuple[str, str]]) -> None:
+    """Send messages to multiple panes simultaneously.
+
+    Uses hex mode via bash scripts for TUI compatibility (no bracket-paste).
+    All panes receive text concurrently via background subshells (&).
+    Each pane's hex is written to a temp file and piped through xargs
+    to avoid argument-length limits.
+
+    Phase 1: Write hex files for each pane
+    Phase 2: Send hex to all panes concurrently (bash & + xargs)
+    Phase 3: Settle wait for TUI rendering
+    Phase 4: Send Enter to all panes concurrently + verify
+    """
+    if not pane_messages:
+        return
+
+    # Phase 1: Write hex data to temp files (text only, no Enter)
+    for i, (pane_target, message) in enumerate(pane_messages):
+        clean = message.replace("\n", " ").replace("\r", " ")
+        raw = clean.encode("utf-8")
+        hex_str = " ".join(f"{b:02x}" for b in raw)
+        tmp_file = f"/tmp/_team_hex_{i}.txt"
         subprocess.run(
-            wsl_prefix() + ["tmux", "send-keys", "-t", pane_target, "-H", "0d"],
+            wsl_prefix() + ["bash", "-c", f"cat > {tmp_file}"],
+            input=hex_str.encode("ascii"),
             capture_output=True, timeout=5,
         )
-        time.sleep(ENTER_VERIFY_WAIT_SEC)
-        after = capture_pane_content(pane_target, lines=5)
-        if after != before:
-            break  # Content changed — Enter was accepted
-        logger.warning(
-            "send_message_to_pane: Enter attempt %d/%d — pane unchanged, retrying",
-            attempt + 1, MAX_ENTER_RETRIES,
+
+    # Phase 2: Send hex text to all panes concurrently
+    script_parts = []
+    for i, (pane_target, _) in enumerate(pane_messages):
+        tmp_file = f"/tmp/_team_hex_{i}.txt"
+        script_parts.append(
+            f'( cat {tmp_file} | xargs tmux send-keys -t {pane_target} -H ) &'
         )
+    script_parts.append("wait")
+    subprocess.run(
+        wsl_prefix() + ["bash", "-c", "\n".join(script_parts)],
+        capture_output=True, timeout=60,
+    )
+
+    # Phase 3: Wait for TUI to render text before sending Enter
+    time.sleep(POST_TEXT_SETTLE_SEC)
+
+    # Phase 4: Send named Enter to all panes concurrently (single shot, no retry)
+    # Named Enter works reliably for all TUI CLIs (hex 0d does NOT)
+    enter_parts = []
+    for pane_target, _ in pane_messages:
+        enter_parts.append(f'tmux send-keys -t {pane_target} Enter &')
+    enter_parts.append("wait")
+    subprocess.run(
+        wsl_prefix() + ["bash", "-c", "\n".join(enter_parts)],
+        capture_output=True, timeout=10,
+    )
 
 
 def capture_pane_content(pane_target: str, lines: int = 100) -> str:
@@ -419,12 +524,35 @@ def capture_pane_content(pane_target: str, lines: int = 100) -> str:
     return result.stdout.strip()
 
 
+import re as _re
+
+# Regex to strip ANSI escape sequences
+_ANSI_RE = _re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\x1b\].*?\x07|\x1b[()][AB012]")
+# Common TUI spinner characters
+_SPINNER_CHARS = set("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◑◒◓/-\\●○◉◎▪▫⣾⣽⣻⢿⡿⣟⣯⣷⠁⠂⠄⡀⢀⠠⠐⠈⣀⣤⣶⣿")
+
+
+def _normalize_for_compare(text: str) -> str:
+    """Normalize pane content for stable comparison.
+
+    Strips ANSI escapes, spinner characters, and trailing whitespace
+    so that TUI cosmetic changes don't prevent idle detection.
+    """
+    text = _ANSI_RE.sub("", text)
+    text = "".join(c for c in text if c not in _SPINNER_CHARS)
+    lines = [line.rstrip() for line in text.splitlines()]
+    # Drop empty trailing lines
+    while lines and not lines[-1]:
+        lines.pop()
+    return "\n".join(lines)
+
+
 def wait_for_all_panes_idle(
     pane_targets: dict[str, str],
     stable_secs: int = 5,
     timeout: int = 1800,
-    min_poll: float = 1.0,
-    max_poll: float = 5.0,
+    min_poll: float = 2.0,
+    max_poll: float = 8.0,
 ) -> dict[str, str]:
     """Wait for multiple tmux panes to stop changing, then capture content.
 
@@ -445,7 +573,7 @@ def wait_for_all_panes_idle(
 
     # Snapshot current state BEFORE AI starts responding
     for name, pane in pane_targets.items():
-        content = capture_pane_content(pane, lines=50)
+        content = _normalize_for_compare(capture_pane_content(pane, lines=50))
         initial_contents[name] = content
         last_contents[name] = content
         last_changes[name] = start
@@ -458,7 +586,7 @@ def wait_for_all_panes_idle(
         for name, pane in pane_targets.items():
             if name in done:
                 continue
-            content = capture_pane_content(pane, lines=50)
+            content = _normalize_for_compare(capture_pane_content(pane, lines=50))
 
             if name not in started:
                 # Phase 1: waiting for content to change from initial snapshot
@@ -499,6 +627,155 @@ def wait_for_all_panes_idle(
             results[name] = last_contents[name]
         else:
             results[name] = initial_contents[name]
+
+    return results
+
+
+def extract_new_content(before: str, after: str) -> str:
+    """Extract only the new content added after 'before' snapshot.
+
+    TUI apps (Claude Code, Codex, Gemini CLI) have static footer/status
+    bars at the bottom that don't change between snapshots.  New content
+    (input + AI response) is inserted ABOVE the footer.
+
+    Algorithm:
+    1. Normalize both snapshots (strip ANSI, spinners, whitespace).
+    2. Strip common suffix lines (footer/status bar).
+    3. Anchor-match on the remaining content to find new lines.
+    4. Fallback to prefix-based diff if anchor fails.
+    """
+    norm_before = _normalize_for_compare(before)
+    norm_after = _normalize_for_compare(after)
+
+    before_lines = norm_before.splitlines()
+    after_lines = norm_after.splitlines()
+
+    if not before_lines:
+        return norm_after.strip()
+
+    # Step 1: Strip common suffix (TUI footer/status bar)
+    common_suffix = 0
+    min_len = min(len(before_lines), len(after_lines))
+    for i in range(1, min_len + 1):
+        if before_lines[-i] == after_lines[-i]:
+            common_suffix = i
+        else:
+            break
+
+    if common_suffix > 0:
+        before_trimmed = before_lines[:-common_suffix]
+        after_trimmed = after_lines[:-common_suffix]
+    else:
+        before_trimmed = before_lines
+        after_trimmed = after_lines
+
+    if not before_trimmed:
+        return "\n".join(after_trimmed).strip()
+
+    # Step 2: Anchor-match on trimmed content (footer removed)
+    for anchor_size in range(min(5, len(before_trimmed)), 1, -1):
+        anchor = before_trimmed[-anchor_size:]
+        for i in range(len(after_trimmed) - anchor_size, -1, -1):
+            if after_trimmed[i:i + anchor_size] == anchor:
+                new_lines = after_trimmed[i + anchor_size:]
+                result = "\n".join(new_lines).strip()
+                if result:
+                    return result
+
+    # Step 3: Fallback — find common prefix, return the rest
+    common_prefix = 0
+    min_len = min(len(before_trimmed), len(after_trimmed))
+    for i in range(min_len):
+        if before_trimmed[i] == after_trimmed[i]:
+            common_prefix = i + 1
+        else:
+            break
+
+    new_lines = after_trimmed[common_prefix:]
+    result = "\n".join(new_lines).strip()
+    if result:
+        return result
+
+    # Final fallback: return full trimmed after
+    return "\n".join(after_trimmed).strip()
+
+
+def send_and_capture(
+    pane_target: str,
+    message: str,
+    capture_lines: int = 500,
+    stable_secs: int = 8,
+    timeout: int = 300,
+) -> str:
+    """Send message to a live session and capture only the new response.
+
+    1. Snapshot before
+    2. Send message via hex mode
+    3. Wait for pane to stabilize
+    4. Snapshot after
+    5. Return diff (new content only)
+    """
+    before = capture_pane_content(pane_target, lines=capture_lines)
+    send_message_to_pane(pane_target, message)
+
+    # Single-pane idle wait
+    start = time.time()
+    last_content = capture_pane_content(pane_target, lines=capture_lines)
+    last_change = time.time()
+    poll = 1.0
+
+    while (time.time() - start) < timeout:
+        time.sleep(poll)
+        current = capture_pane_content(pane_target, lines=capture_lines)
+        if current != last_content:
+            last_content = current
+            last_change = time.time()
+            poll = 1.0  # reset to fast polling
+        elif (time.time() - last_change) >= stable_secs:
+            break  # stabilized
+        else:
+            poll = min(poll * 1.5, 5.0)
+
+    after = capture_pane_content(pane_target, lines=capture_lines)
+    return extract_new_content(before, after)
+
+
+def send_and_capture_all(
+    pane_targets: dict[str, str],
+    messages: dict[str, str],
+    capture_lines: int = 500,
+    stable_secs: int = 8,
+    timeout: int = 300,
+) -> dict[str, str]:
+    """Send messages to multiple live sessions in parallel and capture responses.
+
+    1. Snapshot all panes (before)
+    2. Send messages to all panes
+    3. Wait for all panes to stabilize
+    4. Snapshot all panes (after)
+    5. Return diff per pane
+    """
+    # 1. Before snapshots
+    befores: dict[str, str] = {}
+    for model, pane in pane_targets.items():
+        befores[model] = capture_pane_content(pane, lines=capture_lines)
+
+    # 2. Send all messages in parallel
+    pane_sends = [(pane, messages[model]) for model, pane in pane_targets.items() if model in messages]
+    for model, pane in pane_targets.items():
+        if model in messages:
+            update_pane_status(pane, model, "실행중")
+    send_message_to_panes_parallel(pane_sends)
+
+    # 3. Wait for all to stabilize
+    wait_for_all_panes_idle(pane_targets, stable_secs=stable_secs, timeout=timeout)
+
+    # 4. After snapshots & diff
+    results: dict[str, str] = {}
+    for model, pane in pane_targets.items():
+        after = capture_pane_content(pane, lines=capture_lines)
+        results[model] = extract_new_content(befores[model], after)
+        update_pane_status(pane, model, "완료")
 
     return results
 

@@ -80,13 +80,16 @@ def create_team_session(session_name: str) -> dict[str, str]:
 
     # Set pane titles (use list form to avoid quoting issues with spaces)
     labels = {
-        "claude": "Claude (Reasoning)",
-        "codex": "Codex (Code)",
-        "gemini": "Gemini (Research)",
+        "claude": "Claude",
+        "codex": "Codex",
+        "gemini": "Gemini",
         "input": "User Input",
     }
     for role, pane in pane_map.items():
         run_tmux(["select-pane", "-t", pane, "-T", labels[role]], check=False)
+
+    # Increase scrollback buffer for long AI responses
+    run_tmux(["set-option", "-t", session_name, "history-limit", "10000"], check=False)
 
     # Enable pane border status
     run_tmux(["set-option", "-t", session_name, "pane-border-status", "top"], check=False)
@@ -101,9 +104,9 @@ def update_pane_status(pane_target: str, role: str, status: str) -> None:
     Status should be one of: 대기중, 실행중, 완료, 에러
     """
     labels = {
-        "claude": "Claude (Reasoning)",
-        "codex": "Codex (Code)",
-        "gemini": "Gemini (Research)",
+        "claude": "Claude",
+        "codex": "Codex",
+        "gemini": "Gemini",
         "input": "User Input",
     }
     label = labels.get(role, role)

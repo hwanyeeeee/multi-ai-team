@@ -7,11 +7,21 @@ user messages to AI CLIs running in interactive mode in other panes.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
+import os
 import re
 import sys
 import time
+import unicodedata
 from pathlib import Path
+
+try:
+    import tty
+    import termios
+    _HAS_TERMIOS = True
+except ImportError:
+    _HAS_TERMIOS = False
 
 from rich.console import Console
 from rich.panel import Panel
@@ -24,8 +34,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 from config import (
     AI_MODELS,
     CHAT_SYNTHESIS_ENABLED,
-    SMART_ROUTING_KEYWORDS,
-    DEFAULT_ROUTE_MODEL,
     CONTEXT_WARNING_CHARS,
     CONTEXT_RESET_CHARS,
     CONTEXT_CHECK_INTERVAL,
@@ -37,6 +45,7 @@ from config import (
 )
 from ai_worker import (
     send_message_to_pane,
+    send_message_to_panes_parallel,
     capture_pane_content,
     wait_for_all_panes_idle,
     synthesize_responses,
@@ -45,9 +54,236 @@ from ai_worker import (
 )
 from tmux_manager import update_pane_status
 from conversation import ConversationLog, EventStream
-from orchestrator import TaskOrchestrator, BatchDiscussion
+from orchestrator import TaskOrchestrator, BatchDiscussion, LiveBatchDiscussion, LiveTaskOrchestrator
 
 console = Console()
+
+
+def _read_utf8_char(fd: int) -> bytes:
+    """Read one complete UTF-8 character from a file descriptor."""
+    first = os.read(fd, 1)
+    if not first:
+        return b""
+    b = first[0]
+    if b < 0x80:
+        return first
+    elif b < 0xE0:
+        remaining = 1
+    elif b < 0xF0:
+        remaining = 2
+    else:
+        remaining = 3
+    data = first
+    for _ in range(remaining):
+        data += os.read(fd, 1)
+    return data
+
+
+def _char_width(ch: str) -> int:
+    """Display width of a character (2 for CJK, 1 otherwise)."""
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def _redraw_tail(buf: list[str], pos: int, clear_extra: int = 0) -> None:
+    """Redraw buffer content from pos to end, then reposition cursor.
+
+    After writing the tail characters plus ``clear_extra`` spaces (to erase
+    leftover characters from a deletion), moves the cursor back to ``pos``.
+    """
+    tail = buf[pos:]
+    tail_w = sum(_char_width(c) for c in tail)
+    sys.stdout.write("".join(tail))
+    if clear_extra:
+        sys.stdout.write(" " * clear_extra)
+    # Move cursor back to pos
+    back = tail_w + clear_extra
+    if back:
+        sys.stdout.write(f"\x1b[{back}D")
+    sys.stdout.flush()
+
+
+def read_line(prompt: str = "You > ") -> str:
+    """Read a line of input with CJK-safe editing and arrow key navigation.
+
+    Uses cbreak mode to read character-by-character and manually
+    manages cursor movement so that wide characters (Korean, etc.)
+    are properly erased on backspace inside tmux.
+
+    Supports: left/right arrows, Home/End, Delete, insert at cursor.
+    Falls back to plain input() on platforms without termios (Windows).
+    """
+    if not _HAS_TERMIOS or not sys.stdin.isatty():
+        try:
+            return input(prompt)
+        except KeyboardInterrupt:
+            print()  # newline after ^C
+            return ""
+
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        # Disable ISIG so Ctrl+C is delivered as raw byte (0x03)
+        # instead of generating SIGINT that kills the process
+        attrs = termios.tcgetattr(fd)
+        attrs[3] = attrs[3] & ~termios.ISIG  # lflags
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        buf: list[str] = []
+        pos = 0  # cursor position (character index into buf)
+        while True:
+            raw = _read_utf8_char(fd)
+            if not raw:
+                raise EOFError
+
+            # Enter
+            if raw in (b"\r", b"\n"):
+                sys.stdout.write("\r\n")
+                sys.stdout.flush()
+                return "".join(buf)
+
+            # Backspace / DEL
+            if raw in (b"\x7f", b"\x08"):
+                if pos > 0:
+                    removed = buf.pop(pos - 1)
+                    pos -= 1
+                    w = _char_width(removed)
+                    sys.stdout.write("\b" * w)
+                    _redraw_tail(buf, pos, clear_extra=w)
+                continue
+
+            # Ctrl+C — clear entire input line (not exit)
+            if raw == b"\x03":
+                # Move cursor to start, clear displayed text, reset buffer
+                if pos > 0:
+                    left_w = sum(_char_width(c) for c in buf[:pos])
+                    sys.stdout.write("\b" * left_w)
+                total_w = sum(_char_width(c) for c in buf)
+                sys.stdout.write(" " * total_w + "\b" * total_w)
+                sys.stdout.flush()
+                buf.clear()
+                pos = 0
+                continue
+
+            # Ctrl+D on empty line
+            if raw == b"\x04":
+                if not buf:
+                    raise EOFError
+                continue
+
+            # Ctrl+U — erase to start of line
+            if raw == b"\x15":
+                if pos > 0:
+                    left_w = sum(_char_width(c) for c in buf[:pos])
+                    sys.stdout.write("\b" * left_w)
+                    del buf[:pos]
+                    pos = 0
+                    total_w = sum(_char_width(c) for c in buf)
+                    sys.stdout.write("".join(buf))
+                    sys.stdout.write(" " * left_w)
+                    sys.stdout.write("\b" * (total_w + left_w))
+                    sys.stdout.flush()
+                continue
+
+            # Ctrl+K — erase to end of line
+            if raw == b"\x0b":
+                if pos < len(buf):
+                    tail_w = sum(_char_width(c) for c in buf[pos:])
+                    del buf[pos:]
+                    sys.stdout.write(" " * tail_w)
+                    sys.stdout.write("\b" * tail_w)
+                    sys.stdout.flush()
+                continue
+
+            # Ctrl+A — move to start
+            if raw == b"\x01":
+                if pos > 0:
+                    left_w = sum(_char_width(c) for c in buf[:pos])
+                    sys.stdout.write(f"\x1b[{left_w}D")
+                    sys.stdout.flush()
+                    pos = 0
+                continue
+
+            # Ctrl+E — move to end
+            if raw == b"\x05":
+                if pos < len(buf):
+                    right_w = sum(_char_width(c) for c in buf[pos:])
+                    sys.stdout.write(f"\x1b[{right_w}C")
+                    sys.stdout.flush()
+                    pos = len(buf)
+                continue
+
+            # Escape sequences (arrows, Home/End, Delete)
+            if raw == b"\x1b":
+                next_b = os.read(fd, 1)
+                if next_b == b"[":
+                    # Read CSI sequence: collect until final byte (0x40-0x7E)
+                    seq_bytes = bytearray()
+                    while True:
+                        sb = os.read(fd, 1)
+                        seq_bytes += sb
+                        if sb and (0x40 <= sb[0] <= 0x7E):
+                            break
+                    seq = bytes(seq_bytes)
+
+                    # Left arrow: ESC[D
+                    if seq == b"D" and pos > 0:
+                        w = _char_width(buf[pos - 1])
+                        sys.stdout.write(f"\x1b[{w}D")
+                        sys.stdout.flush()
+                        pos -= 1
+
+                    # Right arrow: ESC[C
+                    elif seq == b"C" and pos < len(buf):
+                        w = _char_width(buf[pos])
+                        sys.stdout.write(f"\x1b[{w}C")
+                        sys.stdout.flush()
+                        pos += 1
+
+                    # Home: ESC[H or ESC[1~
+                    elif seq in (b"H", b"1~") and pos > 0:
+                        left_w = sum(_char_width(c) for c in buf[:pos])
+                        sys.stdout.write(f"\x1b[{left_w}D")
+                        sys.stdout.flush()
+                        pos = 0
+
+                    # End: ESC[F or ESC[4~
+                    elif seq in (b"F", b"4~") and pos < len(buf):
+                        right_w = sum(_char_width(c) for c in buf[pos:])
+                        sys.stdout.write(f"\x1b[{right_w}C")
+                        sys.stdout.flush()
+                        pos = len(buf)
+
+                    # Delete: ESC[3~
+                    elif seq == b"3~" and pos < len(buf):
+                        removed = buf.pop(pos)
+                        w = _char_width(removed)
+                        _redraw_tail(buf, pos, clear_extra=w)
+
+                    # Up/Down arrows: ignore (no history)
+                continue
+
+            # Regular printable character
+            try:
+                ch = raw.decode("utf-8")
+                if ch.isprintable():
+                    buf.insert(pos, ch)
+                    pos += 1
+                    if pos == len(buf):
+                        # Appending at end — just write the char
+                        sys.stdout.write(ch)
+                        sys.stdout.flush()
+                    else:
+                        # Inserting in middle — write char then redraw tail
+                        sys.stdout.write(ch)
+                        _redraw_tail(buf, pos)
+            except UnicodeDecodeError:
+                pass
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
 
 def parse_mentions(
     message: str, active_models: list[str]
@@ -78,24 +314,6 @@ def parse_mentions(
     return clean, mentioned
 
 
-def smart_route(message: str, active_models: list[str]) -> list[str]:
-    """Route message to best AI(s) based on keyword matching."""
-    lower = message.lower()
-    scores: dict[str, int] = {}
-    for model, keywords in SMART_ROUTING_KEYWORDS.items():
-        if model not in active_models:
-            continue
-        scores[model] = sum(1 for kw in keywords if kw in lower)
-
-    # No matches → default model
-    if not scores or max(scores.values()) == 0:
-        fallback = DEFAULT_ROUTE_MODEL if DEFAULT_ROUTE_MODEL in active_models else active_models[0]
-        return [fallback]
-
-    # Return models with score > 0, sorted by score descending
-    matched = [m for m, s in sorted(scores.items(), key=lambda x: -x[1]) if s > 0]
-    return matched[:2]  # max 2 models
-
 
 def _print_synthesis(summary: str) -> None:
     """Print formatted synthesis result."""
@@ -105,22 +323,46 @@ def _print_synthesis(summary: str) -> None:
 def _broadcast_result_to_panes(
     result: str,
     context_label: str,
+    topic: str,
     pane_map: dict[str, str],
     active_models: list[str],
     work_dir: str,
 ) -> None:
-    """Send result summary + session path to all AI panes so they have context."""
-    session_dir = str(get_shared_dir(work_dir))
-    # Truncate result to keep the message manageable for TUI input
-    short_result = result[:500] + "..." if len(result) > 500 else result
-    context_msg = (
-        f"[{context_label} Result] Session directory: {session_dir} . "
-        f"Summary: {short_result}"
+    """Send result summary to all AI panes so they can continue the conversation.
+
+    This is the key mechanism for context continuity: after /batch or /task
+    finishes, the interactive AI sessions receive the synthesis so the user
+    can keep chatting without re-explaining everything.
+
+    Long results are written to a file and AIs are told to read it,
+    avoiding hex-mode overload and tmux rendering lag.
+    """
+    import subprocess
+    from config import wsl_prefix
+
+    # Write full result to a file so AIs can read it without hex overload
+    result_file = f"/tmp/_team_{context_label.lower().replace(' ', '_')}_result.txt"
+    subprocess.run(
+        wsl_prefix() + ["bash", "-c", f"cat > {result_file}"],
+        input=result.encode("utf-8"),
+        capture_output=True, timeout=10,
     )
+
+    # Send short instruction (not the full result) to each AI
+    context_msg = (
+        f"[Previous {context_label} Result] "
+        f"Topic: {topic[:200]} . "
+        f"The full synthesis result has been saved to {result_file} . "
+        f"Read that file if you need the details. "
+        f"Wait for the operator's next instruction."
+    )
+    pane_sends = []
     for model in active_models:
         pane = pane_map.get(model)
         if pane:
-            send_message_to_pane(pane, context_msg)
+            pane_sends.append((pane, context_msg))
+    if pane_sends:
+        send_message_to_panes_parallel(pane_sends)
 
 
 def handle_command(
@@ -149,13 +391,11 @@ def handle_command(
     if lower == "/models":
         table = Table(title="Active Models")
         table.add_column("Mention", style="cyan")
-        table.add_column("Label", style="green")
-        table.add_column("Strengths", style="yellow")
+        table.add_column("Name", style="green")
         for m in active_models:
             cfg = AI_MODELS.get(m, {})
             label = cfg.get("label", m)
-            strengths = ", ".join(cfg.get("strengths", []))
-            table.add_row(f"@{m}", label, strengths)
+            table.add_row(f"@{m}", label)
         console.print(table)
         return False
 
@@ -187,10 +427,11 @@ def handle_command(
         if not work_dir:
             console.print("[bold red]Error: work_dir not set. Cannot run /task.[/bold red]")
             return False
-        orch = TaskOrchestrator(pane_map, work_dir, active_models)
+        orch = LiveTaskOrchestrator(pane_map, work_dir, active_models)
         result = orch.run(task_desc)
         _print_synthesis(result)
-        _broadcast_result_to_panes(result, "Task", pane_map, active_models, work_dir)
+        log.add("system", f"[Task Result] {result[:500]}")
+        _broadcast_result_to_panes(result, "Task", task_desc, pane_map, active_models, work_dir)
         # Reset statuses
         for m in active_models:
             if m in pane_map:
@@ -205,20 +446,15 @@ def handle_command(
         if not work_dir:
             console.print("[bold red]Error: work_dir not set. Cannot run /batch.[/bold red]")
             return False
-        disc = BatchDiscussion(work_dir, active_models, pane_map=pane_map)
+        disc = LiveBatchDiscussion(work_dir, active_models, pane_map=pane_map)
         result = disc.run(topic)
         _print_synthesis(result)
-        _broadcast_result_to_panes(result, "Batch", pane_map, active_models, work_dir)
-        return False
-
-    if lower == "/route":
-        table = Table(title="Smart Routing Keywords")
-        table.add_column("Model", style="cyan")
-        table.add_column("Keywords", style="yellow")
-        for model, keywords in SMART_ROUTING_KEYWORDS.items():
-            table.add_row(model, ", ".join(keywords))
-        table.add_row("[dim]default[/dim]", f"[dim]{DEFAULT_ROUTE_MODEL}[/dim]")
-        console.print(table)
+        log.add("system", f"[Batch Result] {topic}: {result[:500]}")
+        _broadcast_result_to_panes(result, "Batch Discussion", topic, pane_map, active_models, work_dir)
+        # Reset statuses after batch completion
+        for m in active_models:
+            if m in pane_map:
+                update_pane_status(pane_map[m], m, "대기중")
         return False
 
     if lower == "/sessions":
@@ -290,7 +526,6 @@ def handle_command(
             "  /history        - Show message log\n"
             "  /clear          - Clear log\n"
             "  /models         - Show available AI models\n"
-            "  /route          - Show smart routing keywords\n"
             "  /synth          - Capture AI responses & synthesize\n"
             "  /autosynth      - Toggle auto-synthesis on/off\n"
             "  /task <desc>    - Auto-orchestrate: plan, assign, execute\n"
@@ -303,7 +538,7 @@ def handle_command(
             "  @codex analyze this code     - Send to specific AI\n"
             "  @claude @gemini review this  - Send to multiple AIs\n"
             "  @all what do you think?      - Send to ALL AIs\n"
-            "  (no mention = smart routing based on keywords)"
+            "  (no mention = broadcast to all AIs)"
         )
         console.print(Panel(help_text, title="Help"))
         return False
@@ -314,13 +549,8 @@ def handle_command(
 
 def _team_context_for(model: str, active_models: list[str]) -> str:
     """Build team context string for a single model."""
-    cfg = AI_MODELS.get(model, {})
-    teammates = [
-        AI_MODELS[m]["label"] for m in active_models if m != model
-    ]
+    teammates = [m for m in active_models if m != model]
     return INTERACTIVE_TEAM_CONTEXT.format(
-        label=cfg.get("label", model),
-        strengths=", ".join(cfg.get("strengths", [])),
         teammates=", ".join(teammates) if teammates else "none",
         name=model,
     )
@@ -328,9 +558,8 @@ def _team_context_for(model: str, active_models: list[str]) -> str:
 
 def _summarize_for_reset(model: str, conversation: str, work_dir: str) -> str:
     """Use Claude batch mode to summarize conversation before context reset."""
-    label = AI_MODELS.get(model, {}).get("label", model)
     prompt = CONTEXT_RESET_SUMMARY_PROMPT.format(
-        label=label, conversation=conversation[-8000:]
+        name=model, conversation=conversation[-8000:]
     )
     output_file = str(get_shared_dir(work_dir) / f"{model}_reset_summary.md")
     result = run_ai_cli("claude", prompt, work_dir, output_file)
@@ -373,9 +602,7 @@ def run_chat_loop(
 
     while True:
         try:
-            # Custom prompt for user input
-            console.print("[bold blue]You > [/bold blue]", end="")
-            user_input = sys.stdin.readline().strip()
+            user_input = read_line("You > ").strip()
         except (EOFError, KeyboardInterrupt):
             console.print("\n[bold yellow]Goodbye![/bold yellow]")
             break
@@ -420,7 +647,7 @@ def run_chat_loop(
         if targets:
             target_models = targets                          # @mention or @all explicit
         else:
-            target_models = smart_route(clean_msg, active_models)  # smart routing
+            target_models = list(active_models)              # broadcast to all
         log.add("user", clean_msg, targets)
 
         # Record topic from first user message
@@ -428,21 +655,25 @@ def run_chat_loop(
             update_session_meta(topic=clean_msg[:50])
             topic_set = True
 
-        # Send message to each target AI pane
+        # Send message to all target AI panes in parallel
         sent = []
+        pane_sends = []
         for model_name in target_models:
             pane = pane_map.get(model_name)
             if pane:
                 update_pane_status(pane, model_name, "실행중")
-                send_message_to_pane(pane, clean_msg)
+                pane_sends.append((pane, clean_msg))
                 sent.append(model_name)
+
+        if pane_sends:
+            send_message_to_panes_parallel(pane_sends)
 
         if targets:
             labels = [AI_MODELS[m]["label"] for m in sent]
             console.print(f"  [bold green]-> Sent to:[/bold green] {', '.join(labels)}")
         else:
             labels = [AI_MODELS[m]["label"] for m in sent]
-            console.print(f"  [bold green]-> Routed to:[/bold green] {', '.join(labels)}")
+            console.print(f"  [bold green]-> Broadcast to:[/bold green] {', '.join(labels)}")
 
         events.log("message", detail=clean_msg[:80], metadata={"targets": sent})
 
@@ -454,13 +685,61 @@ def run_chat_loop(
             console.print("  [bold magenta]Synthesizing with Claude...[/bold magenta]")
             summary = synthesize_responses(responses, clean_msg, work_dir)
             _print_synthesis(summary)
-            # Reset statuses to 완료 is handled by wait_for_all_panes_idle
-            # But let's make sure they are set to 대기중 eventually or just leave as 완료
+
+            # Share each AI's response with the others via files (cross-session context)
+            console.print("  [italic]Sharing responses across AI sessions...[/italic]")
+            import subprocess as _sp
+            from config import wsl_prefix as _wsl
+            cross_sends = []
+            for model in sent:
+                pane = pane_map.get(model)
+                if not pane:
+                    continue
+                others_text = "\n\n".join(
+                    f"=== {AI_MODELS[m]['label']} ===\n{resp}"
+                    for m, resp in responses.items()
+                    if m != model and resp.strip()
+                )
+                if others_text:
+                    ctx_file = f"/tmp/_team_ctx_for_{model}.txt"
+                    _sp.run(
+                        _wsl() + ["bash", "-c", f"cat > {ctx_file}"],
+                        input=others_text.encode("utf-8"),
+                        capture_output=True, timeout=10,
+                    )
+                    ctx_msg = (
+                        f"[Team Context] Other AIs responded to '{clean_msg[:80]}'. "
+                        f"Read {ctx_file} for their full responses. "
+                        f"Keep this in mind for the next instruction."
+                    )
+                    cross_sends.append((pane, ctx_msg))
+
+            if cross_sends:
+                send_message_to_panes_parallel(cross_sends)
+
             for m in sent:
                 if m in pane_map:
                     update_pane_status(pane_map[m], m, "대기중")
         else:
             console.print("  [italic](Watch their panes for responses)[/italic]")
+            # When auto_synth is off, we don't wait — but we still need to
+            # reset status after AI finishes. Use a background thread.
+            if sent:
+                def _reset_status_after_idle(models, pm):
+                    try:
+                        targets = {m: pm[m] for m in models if m in pm}
+                        wait_for_all_panes_idle(targets)
+                        for m in models:
+                            if m in pm:
+                                update_pane_status(pm[m], m, "대기중")
+                    except Exception:
+                        pass
+                import threading
+                threading.Thread(
+                    target=_reset_status_after_idle,
+                    args=(list(sent), dict(pane_map)),
+                    daemon=True,
+                ).start()
 
         # Context monitoring
         msg_count += 1
