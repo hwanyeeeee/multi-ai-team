@@ -305,6 +305,7 @@ multi_ai_team/
 ├── round_manager.py    # 배치 모드 멀티라운드 프로토콜
 ├── conversation.py     # ConversationLog, SharedContext, EventStream
 ├── docs/
+│   ├── architecture.md # 시스템 아키텍처 기술 문서
 │   └── protocol.md     # 메시지 교환 프로토콜 규격
 └── tests/              # 테스트
 ```

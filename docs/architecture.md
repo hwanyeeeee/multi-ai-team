@@ -83,8 +83,8 @@ claude --dangerously-skip-permissions "$(cat /tmp/_team_init_claude.txt)"
 
 | 상수 | 값 | 설명 |
 |------|-----|------|
-| `HEX_CHUNK_BYTES` | 200 | 한 번에 전송하는 hex 바이트 수 |
-| `HEX_CHUNK_DELAY_SEC` | 0.2 | 청크 간 대기 시간 |
+| `HEX_CHUNK_BYTES` | 100 | 한 번에 전송하는 hex 바이트 수 |
+| `HEX_CHUNK_DELAY_SEC` | 0.3 | 청크 간 대기 시간 |
 | `POST_TEXT_SETTLE_SEC` | 2.0 | Enter 전 TUI 렌더링 대기 |
 | `ENTER_BASE_DELAY_SEC` | 1.0 | 첫 Enter 전 대기 |
 | `ENTER_RETRY_BACKOFF_SEC` | 1.0 | 재시도당 추가 대기 |
